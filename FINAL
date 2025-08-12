@@ -1,0 +1,1962 @@
+import sys
+import csv
+import os
+import math
+import numpy as np
+import cv2
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+import matplotlib.ticker as ticker
+
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QHBoxLayout, QVBoxLayout,
+    QPushButton, QLabel, QFileDialog, QInputDialog, QSizePolicy, QMessageBox,
+    QLineEdit, QGridLayout, QGroupBox, QSlider, QMainWindow
+)
+from PyQt5.QtCore import QTimer, Qt, QTime, QCoreApplication, QEvent, QPoint
+from PyQt5.QtGui import QImage, QPixmap
+
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+import matplotlib.gridspec as gridspec
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+import matplotlib.patches as patches
+
+from PIL import ImageFont, ImageDraw, Image
+from openpyxl import Workbook
+
+
+# 한글 폰트 설정 (윈도우용 예시)
+font_path = "C:/Windows/Fonts/malgun.ttf"  # '맑은 고딕' 경로 (사용 환경에 맞게 변경 필요)
+try:
+    font_prop = fm.FontProperties(fname=font_path).get_name()
+    matplotlib.rc('font', family=font_prop)
+    korean_font = ImageFont.truetype(font_path, 25)
+    korean_font_small = ImageFont.truetype(font_path, 18)
+except FileNotFoundError:
+    print(f"Warning: Font file not found at {font_path}. Using default font.")
+    matplotlib.rc('font', family='sans-serif')
+    korean_font = ImageFont.load_default()
+    korean_font_small = ImageFont.load_default()
+
+# 마이너스 깨짐 방지
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+PIXEL_TO_MM = 0.1  # 기본 픽셀 당 mm 변환 비율 (초기값)
+
+def put_korean_text_on_cv2_image(img, text, pos, font, font_color):
+    # OpenCV 이미지를 PIL 이미지로 변환
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    # 텍스트 그리기
+    draw.text(pos, text, font=font, fill=font_color)
+    # 다시 OpenCV 이미지로 변환
+    img_cv2 = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    return img_cv2
+
+class MultiPlotWidget(QWidget):
+    def __init__(self, max_points=100):
+        super().__init__()
+        self.max_points = max_points
+
+        self.fig = Figure(figsize=(20, 18))
+        self.canvas = FigureCanvas(self.fig)
+
+        gs = gridspec.GridSpec(3, 1, height_ratios=[2, 2, 6], hspace=0.6)
+
+        self.ax1 = self.fig.add_subplot(gs[0, 0])  # X 이동량
+        self.ax2 = self.fig.add_subplot(gs[1, 0])  # Y 이동량
+        self.ax3 = self.fig.add_subplot(gs[2, 0])  # XY 궤적
+
+        self.ax1.set_title("X 방향 프레임 간 이동량")
+        self.ax1.set_ylabel("이동량 (mm)")
+        self.ax1.grid(True)
+        self.ax1.axhline(0, color='gray', linestyle='--', linewidth=0.8, label='_nolegend_')
+
+        self.ax2.set_title("Y 방향 프레임 간 이동량")
+        self.ax2.set_ylabel("이동량 (mm)")
+        self.ax2.grid(True)
+        self.ax2.axhline(0, color='gray', linestyle='--', linewidth=0.8, label='_nolegend_')
+
+        self.ax3.set_title("원점 기준 XY 이동 궤적 (mm 단위)")
+        self.ax3.set_xlabel("X 이동 거리 (mm)")
+        self.ax3.set_ylabel("Y 이동 거리 (mm)")
+        self.ax3.grid(True)
+        self.ax3.axis('equal')
+
+        # 초기 축 범위
+        self.ax1.set_ylim(-0.1, 0.1)
+        self.ax2.set_ylim(-0.1, 0.1)
+        self.ax3.set_xlim(-10, 10)
+        self.ax3.set_ylim(-10, 10)
+        self.ax3.set_aspect('equal', adjustable='box')
+
+        self.x_disp_data = []
+        self.y_disp_data = []
+        self.frame_idx = []
+
+        self.line1, = self.ax1.plot([], [], 'r-', label='X 이동량 (mm)')
+        self.line2, = self.ax2.plot([], [], 'b-', label='Y 이동량 (mm)')
+        self.traj_line, = self.ax3.plot([], [], 'g-', label='이동 궤적')
+
+        # 시작/끝 마커
+        self.start_marker, = self.ax3.plot([], [], 'bo', markersize=7, label='시작점', zorder=5)
+        self.end_marker, = self.ax3.plot([], [], 'rs', markersize=7, label='끝점', zorder=5)
+
+        self.ax1.legend()
+        self.ax2.legend()
+        self.ax3.legend()
+
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.updateGeometry()
+        self.toolbar = NavigationToolbar(self.canvas, self)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas)
+        self.setLayout(layout)
+
+        self.max_distance_from_center = 0.0
+        self.pass_fail_result = "-"   # "합격" / "불합격" / "-"
+
+
+        self.circle_patch = None
+
+        # --- 사용자 확대/이동 보존 플래그 ---
+        self.lock_ax1 = False
+        self.lock_ax2 = False
+        self.lock_ax3 = False
+
+        # 사용자가 축을 바꾸면 자동으로 락 걸기
+        # self.ax1.callbacks.connect('xlim_changed', lambda ax: self._lock_ax('ax1'))
+        # self.ax1.callbacks.connect('ylim_changed', lambda ax: self._lock_ax('ax1'))
+        # self.ax2.callbacks.connect('xlim_changed', lambda ax: self._lock_ax('ax2'))
+        # self.ax2.callbacks.connect('ylim_changed', lambda ax: self._lock_ax('ax2'))
+        self.ax3.callbacks.connect('xlim_changed', lambda ax: self._lock_ax('ax3'))
+        self.ax3.callbacks.connect('ylim_changed', lambda ax: self._lock_ax('ax3'))
+
+        self.fig.tight_layout(pad=3.0)
+
+        self._loc_cache = dict(ax1x=None, ax1y=None, ax2x=None, ax2y=None, ax3x=None, ax3y=None)
+
+
+    def _lock_ax(self, which):
+        if which == 'ax1': self.lock_ax1 = True
+        elif which == 'ax2': self.lock_ax2 = True
+        elif which == 'ax3': self.lock_ax3 = True
+
+    def update_plot(self, frame_number, dx_px, dy_px, pixel_to_mm=PIXEL_TO_MM,
+                    traj_x_offset=0.0, traj_y_offset=0.0,
+                    ax1_ylim_min=None, ax1_ylim_max=None,
+                    ax2_ylim_min=None, ax2_ylim_max=None,
+                    ax3_xlim_min=None, ax3_xlim_max=None,
+                    ax3_ylim_min=None, ax3_ylim_max=None,
+                    ax1_xtick_interval=None, ax1_ytick_interval=None,
+                    ax2_xtick_interval=None, ax2_ytick_interval=None,
+                    ax3_xtick_interval=None, ax3_ytick_interval=None,
+                    global_cumulative_x=None, global_cumulative_y=None,
+                    circle_center_x=None, circle_center_y=None, circle_radius=None):
+
+        dx = dx_px * pixel_to_mm
+        dy = dy_px * pixel_to_mm
+
+        # 데이터 적재
+        self.frame_idx.append(frame_number)
+        self.x_disp_data.append(dx)
+        self.y_disp_data.append(dy)
+        if len(self.frame_idx) > self.max_points:
+            self.frame_idx.pop(0); self.x_disp_data.pop(0); self.y_disp_data.pop(0)
+
+        # 라인 갱신
+        self.line1.set_data(self.frame_idx, self.x_disp_data)
+        self.line2.set_data(self.frame_idx, self.y_disp_data)
+
+        # 라벨/축 제목
+        self.ax1.set_xlabel("프레임 번호")
+        self.ax2.set_xlabel("프레임 번호")
+        self.ax1.set_ylabel("X 프레임 간 이동량 (mm)")
+        self.ax2.set_ylabel("Y 프레임 간 이동량 (mm)")
+
+        # 궤적 갱신
+        if global_cumulative_x is not None and global_cumulative_y is not None:
+            x_plot = np.array(global_cumulative_x) - traj_x_offset
+            y_plot = np.array(global_cumulative_y) - traj_y_offset
+            self.traj_line.set_data(x_plot, y_plot)
+        else:
+            self.traj_line.set_data([], [])
+
+        # 시작/끝 마커
+        if global_cumulative_x is not None and len(global_cumulative_x) >= 1:
+            sx = global_cumulative_x[0] - traj_x_offset
+            sy = global_cumulative_y[0] - traj_y_offset
+            self.start_marker.set_data([sx], [sy])
+        else:
+            self.start_marker.set_data([], [])
+
+        if global_cumulative_x is not None and len(global_cumulative_x) >= 2:
+            ex = global_cumulative_x[-1] - traj_x_offset
+            ey = global_cumulative_y[-1] - traj_y_offset
+            self.end_marker.set_data([ex], [ey])
+        else:
+            self.end_marker.set_data([], [])
+
+        # 판정 원
+        if circle_center_x is not None and circle_center_y is not None and circle_radius and circle_radius > 0:
+            if self.circle_patch is None:
+                self.circle_patch = patches.Circle((circle_center_x, circle_center_y), circle_radius,
+                                                edgecolor='red', facecolor='none', linestyle='--', linewidth=2,
+                                                label='판정 기준 원')
+                self.ax3.add_patch(self.circle_patch)
+                leg = self.ax3.legend_
+                if leg is None:
+                    self.ax3.legend()
+                else:
+                    if '판정 기준 원' not in [t.get_text() for t in leg.texts]:
+                        self.ax3.legend()
+
+            else:
+                self.circle_patch.center = (circle_center_x, circle_center_y)
+                self.circle_patch.set_radius(circle_radius)
+        else:
+            if self.circle_patch is not None:
+                self.circle_patch.remove()
+                self.circle_patch = None
+
+        # 눈금 간격
+        self.ax1.tick_params(axis='x', labelsize=plt.rcParams['font.size'])
+        self.ax1.tick_params(axis='y', labelsize=plt.rcParams['font.size'])
+        self.ax2.tick_params(axis='x', labelsize=plt.rcParams['font.size'])
+        self.ax2.tick_params(axis='y', labelsize=plt.rcParams['font.size'])
+        self.ax3.tick_params(axis='x', labelsize=plt.rcParams['font.size'])
+        self.ax3.tick_params(axis='y', labelsize=plt.rcParams['font.size'])
+
+        self.ax1.xaxis.set_major_locator(ticker.MultipleLocator(ax1_xtick_interval) if ax1_xtick_interval is not None else ticker.AutoLocator())
+        self.ax1.yaxis.set_major_locator(ticker.MultipleLocator(ax1_ytick_interval) if ax1_ytick_interval is not None else ticker.AutoLocator())
+        self.ax2.xaxis.set_major_locator(ticker.MultipleLocator(ax2_xtick_interval) if ax2_xtick_interval is not None else ticker.AutoLocator())
+        self.ax2.yaxis.set_major_locator(ticker.MultipleLocator(ax2_ytick_interval) if ax2_ytick_interval is not None else ticker.AutoLocator())
+        self.ax3.xaxis.set_major_locator(ticker.MultipleLocator(ax3_xtick_interval) if ax3_xtick_interval is not None else ticker.AutoLocator())
+        self.ax3.yaxis.set_major_locator(ticker.MultipleLocator(ax3_ytick_interval) if ax3_ytick_interval is not None else ticker.AutoLocator())
+
+        # ---- X축 자동 스크롤 (항상 적용) ----
+        if self.frame_idx:
+            x_end = self.frame_idx[-1]
+            window = self.max_points
+            x_start = max(0, x_end - (window - 1))
+        else:
+            x_start, x_end = 0, self.max_points - 1
+
+        self.ax1.set_xlim(x_start, x_end)
+        self.ax2.set_xlim(x_start, x_end)
+       
+        if ax1_ylim_min is not None and ax1_ylim_max is not None:
+            self.ax1.set_ylim(ax1_ylim_min, ax1_ylim_max)
+
+        if ax2_ylim_min is not None and ax2_ylim_max is not None:
+            self.ax2.set_ylim(ax2_ylim_min, ax2_ylim_max)
+
+        # ax1, ax2 Y축 수동 범위 (락 아닐 때만)
+        if not self.lock_ax1 and ax1_ylim_min is not None and ax1_ylim_max is not None:
+            self.ax1.set_ylim(ax1_ylim_min, ax1_ylim_max)
+        if not self.lock_ax2 and ax2_ylim_min is not None and ax2_ylim_max is not None:
+            self.ax2.set_ylim(ax2_ylim_min, ax2_ylim_max)
+
+        # ax3 XY 범위 적용 (락 아닐 때만)
+        if not self.lock_ax3:
+            if ax3_xlim_min is not None and ax3_xlim_max is not None:
+                self.ax3.set_xlim(ax3_xlim_min, ax3_xlim_max)
+            if ax3_ylim_min is not None and ax3_ylim_max is not None:
+                self.ax3.set_ylim(ax3_ylim_min, ax3_ylim_max)
+
+        # 비율 유지
+        self.ax3.set_aspect('equal', adjustable='box')
+        self.canvas.draw_idle()
+
+        def _set_locator(ax, axis, newv, key):
+            prev = self._loc_cache[key]
+            if prev != newv:
+                loc = ticker.MultipleLocator(newv) if newv is not None else ticker.AutoLocator()
+                (ax.xaxis if axis=='x' else ax.yaxis).set_major_locator(loc)
+                self._loc_cache[key] = newv
+
+        _set_locator(self.ax1, 'x', ax1_xtick_interval, 'ax1x')
+        _set_locator(self.ax1, 'y', ax1_ytick_interval, 'ax1y')
+        _set_locator(self.ax2, 'x', ax2_xtick_interval, 'ax2x')
+        _set_locator(self.ax2, 'y', ax2_ytick_interval, 'ax2y')
+        _set_locator(self.ax3, 'x', ax3_xtick_interval, 'ax3x')
+        _set_locator(self.ax3, 'y', ax3_ytick_interval, 'ax3y')
+
+        return global_cumulative_x, global_cumulative_y
+
+class ColorTrackerApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("동영상 & 그래프 분석 (mm 단위)")
+        self.resize(1800, 1200)
+        self.frame_idx = []
+        main_layout = QHBoxLayout()
+
+        left_layout = QVBoxLayout()
+
+        # 영상 컨테이너
+        self.video_container_widget = QWidget()
+        self.video_container_widget.setMinimumSize(900, 540)
+        self.video_container_widget.setStyleSheet("background-color: black;")
+
+        # 겹치기 레이아웃
+        video_grid_layout = QGridLayout(self.video_container_widget)
+        video_grid_layout.setContentsMargins(0, 0, 0, 0)
+        video_grid_layout.setSpacing(0)
+
+        self.video_display_label = QLabel("동영상을 선택하세요")
+        self.video_display_label.setAlignment(Qt.AlignCenter)
+        self.video_display_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        video_grid_layout.addWidget(self.video_display_label, 0, 0, 1, 1)
+
+        # 오버레이 (컨트롤)
+        self.video_controls_overlay = QWidget(self.video_container_widget)
+        self.video_controls_overlay.setStyleSheet("background-color: rgba(0, 0, 0, 0.0);")
+        # ★★★ 오버레이가 마우스 이벤트를 통과시키도록 설정 ★★★
+        self.video_controls_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+
+        video_controls_layout = QVBoxLayout(self.video_controls_overlay)
+        video_controls_layout.setContentsMargins(10, 0, 10, 10)
+        video_controls_layout.addStretch()
+
+        # 타임스탬프
+        timestamp_layout = QHBoxLayout()
+        self.current_time_label = QLabel("00:00")
+        self.current_time_label.setStyleSheet("color: white;")
+        self.total_time_label = QLabel("00:00")
+        self.total_time_label.setStyleSheet("color: white;")
+        timestamp_layout.addWidget(self.current_time_label)
+        timestamp_layout.addStretch()
+        timestamp_layout.addWidget(self.total_time_label)
+        video_controls_layout.addLayout(timestamp_layout)
+
+        # 슬라이더
+        self.video_slider = QSlider(Qt.Horizontal)
+        self.video_slider.setRange(0, 0)
+        self.video_slider.sliderMoved.connect(self.set_position)
+        self.video_slider.sliderPressed.connect(self.pause_on_slider_press)
+        self.video_slider.sliderReleased.connect(self.resume_on_slider_release)
+        video_controls_layout.addWidget(self.video_slider)
+
+        # 재생/정지
+        playback_buttons_layout = QHBoxLayout()
+        self.play_pause_button = QPushButton("재생")
+        self.play_pause_button.clicked.connect(self.play_pause_video)
+        self.play_pause_button.setFixedSize(100, 30)
+        self.play_pause_button.setStyleSheet("background-color: white; color: black;")
+        playback_buttons_layout.addWidget(self.play_pause_button)
+
+        self.stop_reset_button = QPushButton("정지/초기화")
+        self.stop_reset_button.clicked.connect(self.stop_reset_video)
+        self.stop_reset_button.setFixedSize(100, 30)
+        self.stop_reset_button.setStyleSheet("background-color: white; color: black;")
+        playback_buttons_layout.addWidget(self.stop_reset_button)
+        playback_buttons_layout.addStretch()
+        video_controls_layout.addLayout(playback_buttons_layout)
+
+        # 오버레이를 라벨 위에 겹치기
+        video_grid_layout.addWidget(self.video_controls_overlay, 0, 0, 1, 1)
+
+        left_layout.addWidget(self.video_container_widget)
+
+        # 상단 버튼
+        top_buttons_layout = QHBoxLayout()
+        self.open_button = QPushButton("영상 열기")
+        self.open_button.clicked.connect(self.open_file)
+        self.open_button.setFixedSize(120, 30)
+        top_buttons_layout.addWidget(self.open_button)
+
+        self.calibrate_button = QPushButton("스케일 보정")
+        self.calibrate_button.clicked.connect(self.start_calibration)
+        self.calibrate_button.setFixedSize(120, 30)
+        top_buttons_layout.addWidget(self.calibrate_button)
+
+        self.set_origin_button = QPushButton("궤적 원점")
+        self.set_origin_button.clicked.connect(self.set_trajectory_origin)
+        self.set_origin_button.setFixedSize(120, 30)
+        top_buttons_layout.addWidget(self.set_origin_button)
+
+        self.save_button = QPushButton("xlsx 저장")
+        self.save_button.clicked.connect(self.save_to_xlsx)
+        self.save_button.setFixedSize(120, 30)
+        top_buttons_layout.addWidget(self.save_button)
+
+        top_buttons_layout.addStretch(1)
+        left_layout.addLayout(top_buttons_layout)
+
+        # FPS/프레임 이동
+        fps_frame_layout = QHBoxLayout()
+        fps_frame_layout.addWidget(QLabel("FPS:"))
+        self.fps_input = QLineEdit()
+        self.fps_input.setPlaceholderText("예: 30")
+        self.fps_input.setFixedSize(60, 30)
+        fps_frame_layout.addWidget(self.fps_input)
+
+        fps_apply_button = QPushButton("적용")
+        fps_apply_button.clicked.connect(self.apply_fps_setting)
+        fps_apply_button.setFixedSize(50, 30)
+        fps_frame_layout.addWidget(fps_apply_button)
+
+        self.decrease_fps_button = QPushButton("-5")
+        self.decrease_fps_button.setFixedSize(40, 30)
+        self.decrease_fps_button.clicked.connect(self.decrease_fps)
+        fps_frame_layout.addWidget(self.decrease_fps_button)
+
+        self.increase_fps_button = QPushButton("+5")
+        self.increase_fps_button.setFixedSize(40, 30)
+        self.increase_fps_button.clicked.connect(self.increase_fps)
+        fps_frame_layout.addWidget(self.increase_fps_button)
+
+        fps_frame_layout.addSpacing(20)
+        fps_frame_layout.addWidget(QLabel("프레임 이동:"))
+        self.frame_seek_input = QLineEdit()
+        self.frame_seek_input.setPlaceholderText("번호 입력")
+        self.frame_seek_input.setFixedSize(80, 30)
+        fps_frame_layout.addWidget(self.frame_seek_input)
+
+        self.go_to_frame_button = QPushButton("이동")
+        self.go_to_frame_button.clicked.connect(self.go_to_frame)
+        fps_frame_layout.addWidget(self.go_to_frame_button)
+
+        fps_frame_layout.addStretch(1)
+        left_layout.addLayout(fps_frame_layout)
+
+        # 그래프 축 설정
+        self.axis_settings_group = QGroupBox("그래프 축 설정")
+        axis_layout = QGridLayout()
+
+        # X 이동량 Y축
+        axis_layout.addWidget(QLabel("X 이동량 Y축 (min, max):"), 0, 0)
+        self.ax1_ylim_min_input = QLineEdit()
+        self.ax1_ylim_min_input.setPlaceholderText("Min (자동)")
+        self.ax1_ylim_max_input = QLineEdit()
+        self.ax1_ylim_max_input.setPlaceholderText("Max (자동)")
+        axis_layout.addWidget(self.ax1_ylim_min_input, 0, 1)
+        axis_layout.addWidget(self.ax1_ylim_max_input, 0, 2)
+        ax1_apply_ylim_button = QPushButton("범위 적용")
+        ax1_apply_ylim_button.clicked.connect(self.apply_ax1_ylim)
+        axis_layout.addWidget(ax1_apply_ylim_button, 0, 3)
+
+        axis_layout.addWidget(QLabel("X 이동량 X축 간격:"), 1, 0)
+        self.ax1_xtick_interval_input = QLineEdit()
+        self.ax1_xtick_interval_input.setPlaceholderText("양수 값 입력 (자동)")
+        axis_layout.addWidget(self.ax1_xtick_interval_input, 1, 1, 1, 2)
+        ax1_apply_xtick_interval_button = QPushButton("적용")
+        ax1_apply_xtick_interval_button.clicked.connect(self.apply_ax1_xtick_interval)
+        axis_layout.addWidget(ax1_apply_xtick_interval_button, 1, 3)
+
+        axis_layout.addWidget(QLabel("X 이동량 Y축 간격:"), 2, 0)
+        self.ax1_ytick_interval_input = QLineEdit()
+        self.ax1_ytick_interval_input.setPlaceholderText("양수 값 입력 (자동)")
+        axis_layout.addWidget(self.ax1_ytick_interval_input, 2, 1, 1, 2)
+        ax1_apply_ytick_interval_button = QPushButton("적용")
+        ax1_apply_ytick_interval_button.clicked.connect(self.apply_ax1_ytick_interval)
+        axis_layout.addWidget(ax1_apply_ytick_interval_button, 2, 3)
+
+        # Y 이동량 Y축
+        axis_layout.addWidget(QLabel("Y 이동량 Y축 (min, max):"), 3, 0)
+        self.ax2_ylim_min_input = QLineEdit()
+        self.ax2_ylim_min_input.setPlaceholderText("Min (자동)")
+        self.ax2_ylim_max_input = QLineEdit()
+        self.ax2_ylim_max_input.setPlaceholderText("Max (자동)")
+        axis_layout.addWidget(self.ax2_ylim_min_input, 3, 1)
+        axis_layout.addWidget(self.ax2_ylim_max_input, 3, 2)
+        ax2_apply_ylim_button = QPushButton("범위 적용")
+        ax2_apply_ylim_button.clicked.connect(self.apply_ax2_ylim)
+        axis_layout.addWidget(ax2_apply_ylim_button, 3, 3)
+
+        axis_layout.addWidget(QLabel("Y 이동량 X축 간격:"), 4, 0)
+        self.ax2_xtick_interval_input = QLineEdit()
+        self.ax2_xtick_interval_input.setPlaceholderText("양수 값 입력 (자동)")
+        axis_layout.addWidget(self.ax2_xtick_interval_input, 4, 1, 1, 2)
+        ax2_apply_xtick_interval_button = QPushButton("적용")
+        ax2_apply_xtick_interval_button.clicked.connect(self.apply_ax2_xtick_interval)
+        axis_layout.addWidget(ax2_apply_xtick_interval_button, 4, 3)
+
+        axis_layout.addWidget(QLabel("Y 이동량 Y축 간격:"), 5, 0)
+        self.ax2_ytick_interval_input = QLineEdit()
+        self.ax2_ytick_interval_input.setPlaceholderText("양수 값 입력 (자동)")
+        axis_layout.addWidget(self.ax2_ytick_interval_input, 5, 1, 1, 2)
+        ax2_apply_ytick_interval_button = QPushButton("적용")
+        ax2_apply_ytick_interval_button.clicked.connect(self.apply_ax2_ytick_interval)
+        axis_layout.addWidget(ax2_apply_ytick_interval_button, 5, 3)
+
+        # XY 궤적 X/Y 범위
+        axis_layout.addWidget(QLabel("XY 궤적 X축 (min, max):"), 6, 0)
+        self.ax3_xlim_min_input = QLineEdit()
+        self.ax3_xlim_min_input.setPlaceholderText("Min (자동)")
+        self.ax3_xlim_max_input = QLineEdit()
+        self.ax3_xlim_max_input.setPlaceholderText("Max (자동)")
+        axis_layout.addWidget(self.ax3_xlim_min_input, 6, 1)
+        axis_layout.addWidget(self.ax3_xlim_max_input, 6, 2)
+        ax3_xlim_apply_button = QPushButton("범위 적용")
+        ax3_xlim_apply_button.clicked.connect(self.apply_ax3_xlim)
+        axis_layout.addWidget(ax3_xlim_apply_button, 6, 3)
+
+        axis_layout.addWidget(QLabel("XY 궤적 Y축 (min, max):"), 7, 0)
+        self.ax3_ylim_min_input = QLineEdit()
+        self.ax3_ylim_min_input.setPlaceholderText("Min (자동)")
+        self.ax3_ylim_max_input = QLineEdit()
+        self.ax3_ylim_max_input.setPlaceholderText("Max (자동)")
+        axis_layout.addWidget(self.ax3_ylim_min_input, 7, 1)
+        axis_layout.addWidget(self.ax3_ylim_max_input, 7, 2)
+        ax3_ylim_apply_button = QPushButton("범위 적용")
+        ax3_ylim_apply_button.clicked.connect(self.apply_ax3_ylim)
+        axis_layout.addWidget(ax3_ylim_apply_button, 7, 3)
+
+        # XY 궤적 눈금 간격
+        axis_layout.addWidget(QLabel("XY 궤적 X축 간격:"), 8, 0)
+        self.ax3_xtick_interval_input = QLineEdit()
+        self.ax3_xtick_interval_input.setPlaceholderText("양수 값 입력 (자동)")
+        axis_layout.addWidget(self.ax3_xtick_interval_input, 8, 1, 1, 2)
+        ax3_apply_xtick_interval_button = QPushButton("적용")
+        ax3_apply_xtick_interval_button.clicked.connect(self.apply_ax3_xtick_interval)
+        axis_layout.addWidget(ax3_apply_xtick_interval_button, 8, 3)
+
+        axis_layout.addWidget(QLabel("XY 궤적 Y축 간격:"), 9, 0)
+        self.ax3_ytick_interval_input = QLineEdit()
+        self.ax3_ytick_interval_input.setPlaceholderText("양수 값 입력 (자동)")
+        axis_layout.addWidget(self.ax3_ytick_interval_input, 9, 1, 1, 2)
+        ax3_apply_ytick_interval_button = QPushButton("적용")
+        ax3_apply_ytick_interval_button.clicked.connect(self.apply_ax3_ytick_interval)
+        axis_layout.addWidget(ax3_apply_ytick_interval_button, 9, 3)
+
+        reset_all_axes_button = QPushButton("모든 축 설정 초기화")
+        reset_all_axes_button.clicked.connect(self.reset_axis_limits)
+        axis_layout.addWidget(reset_all_axes_button, 10, 0, 1, 4)
+
+        self.axis_settings_group.setLayout(axis_layout)
+        left_layout.addWidget(self.axis_settings_group)
+        left_layout.addStretch()
+
+        # 우측: 플롯 + 판정
+        right_layout = QVBoxLayout()
+        self.plot_widget = MultiPlotWidget(max_points=300)
+        right_layout.addWidget(self.plot_widget)
+
+        self.judgment_group = QGroupBox("합/불 판정 기준")
+        judgment_layout = QGridLayout()
+
+        judgment_layout.addWidget(QLabel("원 중심 X (mm):"), 0, 0)
+        self.circle_center_x_input = QLineEdit()
+        self.circle_center_x_input.setPlaceholderText("0.0")
+        judgment_layout.addWidget(self.circle_center_x_input, 0, 1)
+
+        judgment_layout.addWidget(QLabel("원 중심 Y (mm):"), 1, 0)
+        self.circle_center_y_input = QLineEdit()
+        self.circle_center_y_input.setPlaceholderText("0.0")
+        judgment_layout.addWidget(self.circle_center_y_input, 1, 1)
+
+        judgment_layout.addWidget(QLabel("원 반지름 (mm):"), 2, 0)
+        self.circle_radius_input = QLineEdit()
+        self.circle_radius_input.setPlaceholderText("2.0")
+        judgment_layout.addWidget(self.circle_radius_input, 2, 1)
+
+        self.apply_circle_button = QPushButton("기준 적용")
+        self.apply_circle_button.clicked.connect(self.apply_circle_criteria)
+        judgment_layout.addWidget(self.apply_circle_button, 3, 0, 1, 2)
+
+        self.judgment_group.setLayout(judgment_layout)
+        right_layout.addWidget(self.judgment_group)
+
+        self.pass_fail_label = QLabel("판정 결과: -")
+        self.pass_fail_label.setAlignment(Qt.AlignCenter)
+        self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: gray;")
+        right_layout.addWidget(self.pass_fail_label)
+
+        right_layout.addStretch()
+
+        main_layout.addLayout(left_layout)
+        main_layout.addLayout(right_layout)
+
+        main_layout.setStretch(0, 1)
+        main_layout.setStretch(1, 3)
+
+        self.setLayout(main_layout)
+
+        self.cap = None
+        self.prev_center = None
+        self.frame_count = 0
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.next_frame)
+
+        self.lower_yellow = np.array([26, 50, 100])
+        self.upper_yellow = np.array([60, 255, 255])
+
+        self.global_cumulative_x = []
+        self.global_cumulative_y = []
+        self.traj_x_offset = 0.0
+        self.traj_y_offset = 0.0
+
+        self.PIXEL_TO_MM = 0.03
+
+        self.calibrating = False
+        self.calib_points = []
+        self.calibration_frame = None
+        self.was_playing_before_calib = False
+
+        self._orig_mouse_press_event = None
+
+        self.ax1_ylim_min = None
+        self.ax1_ylim_max = None
+        self.ax1_xtick_interval = None
+        self.ax1_ytick_interval = None
+
+        self.ax2_ylim_min = None
+        self.ax2_ylim_max = None
+        self.ax2_xtick_interval = None
+        self.ax2_ytick_interval = None
+
+        self.ax3_xlim_min = -10.0
+        self.ax3_xlim_max = 10.0
+        self.ax3_ylim_min = -10.0
+        self.ax3_ylim_max = 10.0
+        self.ax3_xtick_interval = None
+        self.ax3_ytick_interval = None
+
+        self.current_fps = 60.0
+        self.fps_input.setPlaceholderText(f"예: 30 (현재: {self.current_fps:.2f})")
+
+        self.min_contour_area = 100
+
+        self.video_playing = False
+        self.passed_judgment = True
+
+        self.circle_center_x = 0.0
+        self.circle_center_y = 0.0
+        self.circle_radius = 2.0
+
+        self._calib_hover_img_pos = None
+        self._magnifier_size = 120
+        self._magnifier_zoom = 5
+
+        self.magnifier = QLabel(self.video_display_label)
+        self.magnifier.setFixedSize(self._magnifier_size, self._magnifier_size)
+        self.magnifier.setStyleSheet("border:2px solid #00ffff; background: rgba(0,0,0,0);")
+        self.magnifier.hide()
+        self.magnifier.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        self.judgment_warmup = 10  # 처음 10프레임은 판정 보류
+
+        self.current_fps = 30.0  # 이미 있으면 유지
+        self.video_fps_label = QLabel("Video FPS: --", self.video_display_label)
+        self.video_fps_label.setStyleSheet(
+            "color:white; background:rgba(0,0,0,0.5); padding:2px 6px; font-size:12px;"
+        )
+        self.video_fps_label.raise_()   # 영상 위로 띄우기
+
+        self.source_fps = None  # 원본 영상 FPS (없으면 None)
+
+    def _set_playback_fps(self, new_fps, show_warning=False):
+        if hasattr(self, "source_fps") and self.source_fps:
+            new_fps = min(float(new_fps), float(self.source_fps))  # 원본 FPS 초과 방지
+        self.current_fps = max(0.1, min(float(new_fps), 240.0))
+        self.timer.setInterval(int(1000 / self.current_fps))
+        if hasattr(self, "kf") and self.kf is not None:
+            self.kf.set_dt(1.0 / self.current_fps)
+
+        # UI 동기화
+        self.fps_input.setText(f"{self.current_fps:.2f}")
+        self.fps_input.setPlaceholderText(f"예: 30 (현재: {self.current_fps:.2f})")
+        self.update_fps_label()
+        if show_warning:
+            QMessageBox.information(self, "FPS 설정",
+                                    f"영상 재생 속도가 {self.current_fps:.2f} FPS로 설정되었습니다.")
+
+
+    def reset_origin(self):
+        if self.global_cumulative_x and self.global_cumulative_y:
+            self.traj_x_offset = self.global_cumulative_x[-1]
+            self.traj_y_offset = self.global_cumulative_y[-1]
+            QMessageBox.information(self, "원점 재설정", "현재 위치를 새로운 원점으로 설정했습니다.")
+            print(f"로그: 원점 재설정. Offset = ({self.traj_x_offset:.2f}, {self.traj_y_offset:.2f})")
+            self.update_all_plots()
+        else:
+            QMessageBox.warning(self, "경고", "궤적 데이터가 없어 원점을 재설정할 수 없습니다.")
+
+        # ===== NEW: 가로/세로 직선 스냅 =====
+    def _snap_to_axis(self, p1, p2):
+        """p1=(x1,y1), p2=(x2,y2). p2를 p1 기준 가로/세로 중 더 가까운 축으로 스냅."""
+        x1, y1 = p1
+        x2, y2 = p2
+        if abs(x2 - x1) >= abs(y2 - y1):
+            return (x2, y1)  # 가로로 고정
+        else:
+            return (x1, y2)  # 세로로 고정
+
+
+    def reset_ui_controls(self):
+        print("로그: UI 컨트롤 복구 함수 호출됨.")
+        self.video_controls_overlay.show()
+        self.play_pause_button.show()
+        self.stop_reset_button.show()
+        self.current_time_label.show()
+        self.total_time_label.show()
+        self.video_slider.show()
+        self.play_pause_button.setEnabled(True)
+        self.stop_reset_button.setEnabled(True)
+        self.video_slider.setEnabled(True)
+        print("로그: 모든 UI 컨트롤 show() 및 setEnabled(True) 호출 완료.")
+
+    def update_fps_label(self):
+        # 텍스트
+        self.video_fps_label.setText(f"Video FPS: {self.current_fps:.2f}")
+        self.video_fps_label.adjustSize()
+        # 우하단 배치
+        lw = self.video_display_label.width()
+        lh = self.video_display_label.height()
+        w  = self.video_fps_label.width()
+        h  = self.video_fps_label.height()
+        self.video_fps_label.move(lw - w - 10, lh - h - 10)
+
+
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "동영상 선택", "", "Video Files (*.mp4 *.avi *.mov)")
+        if path:
+            if self.cap is not None:
+                self.cap.release()
+            self.cap = cv2.VideoCapture(path)
+
+            if not self.cap.isOpened():
+                QMessageBox.warning(self, "오류", "동영상 파일을 열 수 없습니다.")
+                print("오류: VideoCapture 객체를 열 수 없습니다. 파일 경로 또는 코덱 문제일 수 있습니다.")
+                self.cap = None
+                self.calibration_frame = None
+                return
+
+            print("로그: VideoCapture 객체 성공적으로 열림.")
+
+            total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_fps = self.cap.get(cv2.CAP_PROP_FPS)
+            self.source_fps = float(video_fps) if video_fps and video_fps > 0 else None
+            self.current_fps = self.source_fps if self.source_fps else 30.0
+            self.timer.setInterval(int(1000 / self.current_fps))
+            self.update_fps_label()
+
+            self.video_slider.setRange(0, total_frames - 1)
+            self.total_duration_sec = total_frames / video_fps if video_fps > 0 else 0
+            self.total_time_label.setText(QTime(0, 0, 0).addSecs(int(self.total_duration_sec)).toString("mm:ss"))
+
+            ret, current_frame_read = self.cap.read()
+            if ret:
+                if np.mean(current_frame_read) < 10:
+                    QMessageBox.warning(self, "경고", "동영상의 첫 프레임이 매우 어둡거나 검은색입니다. 스케일 보정 시 화면이 보이지 않을 수 있습니다.")
+                    print("경고: 첫 프레임이 너무 어둡습니다.")
+                self.display_frame(current_frame_read)
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            else:
+                QMessageBox.warning(self, "오류", "동영상 첫 프레임을 읽을 수 없습니다.")
+                print("오류: 동영상 첫 프레임을 읽을 수 없습니다.")
+                self.cap.release()
+                self.cap = None
+                self.calibration_frame = None
+                return
+
+            self.video_controls_overlay.show()
+            self.reset_ui_controls()
+
+            self.prev_center = None
+            self.kf = KalmanCV2D(dt=1.0/self.current_fps,
+                     process_var=1e-2,
+                     measurement_var=5.0)
+            self.frame_count = 0
+            self.plot_widget.x_disp_data.clear()
+            self.plot_widget.y_disp_data.clear()
+            self.plot_widget.frame_idx.clear()
+            self.global_cumulative_x = [0.0]
+            self.global_cumulative_y = [0.0]
+            self.traj_x_offset = 0.0
+            self.traj_y_offset = 0.0
+            self.calibrating = False
+            self.calib_points.clear()
+
+            self.timer.stop()
+            self.video_playing = False
+            self.play_pause_button.setText("재생")
+
+            self.passed_judgment = True
+            self.pass_fail_label.setText("판정 결과: -")
+            self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: gray;")
+            self.current_time_label.setText("00:00")
+            self.video_slider.setValue(0)
+            self.update_all_plots()
+            self.video_controls_overlay.raise_()   # <-- 추가
+            print("로그: 동영상 열기 및 초기화 완료.")
+
+            self.max_distance_from_center = 0.0
+            self.pass_fail_result = "-"
+
+            self.plot_widget.lock_ax3 = False
+
+            self.prev_center = None
+            self.kf.reset()
+
+            # ✅ 새 영상 열면 스케일 보정값 초기화(기본값으로)
+            self.PIXEL_TO_MM = 0.03
+
+    def next_frame(self):
+        if self.cap is None:
+            return
+
+        ret, frame = self.cap.read()
+        if not ret:
+            print("로그: 더 이상 읽을 프레임이 없습니다. 동영상 종료.")
+            self.timer.stop()
+            self.video_playing = False
+            self.play_pause_button.setText("재생")
+            self.cap.release()
+            self.cap = None
+            if self.global_cumulative_x and self.global_cumulative_y:
+                reply = QMessageBox.question(self, '저장 확인',
+                                             "영상이 종료되었습니다. 측정된 데이터를 xlsx 파일로 저장하시겠습니까?",
+                                             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                if reply == QMessageBox.Yes:
+                    self.save_to_xlsx()
+            return
+
+        self.frame_count = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+
+        if self.calibrating:
+            # 보정 중에는 고정 프레임 계속 표시
+            self.display_frame(self.calibration_frame)
+            return
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self.lower_yellow, self.upper_yellow)
+        mask = cv2.medianBlur(mask, 5)
+        kernel = np.ones((3,3), np.uint8)
+        mask = cv2.erode(mask, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+
+
+        try:
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        except ValueError:
+            _, contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        dx_px, dy_px = 0.0, 0.0
+        valid_contour_found = False
+
+        # --- CHANGED: contour → center 계산 부분은 그대로 두고,
+        # 이후 칼만 필터 처리/속도 계산 로직을 다음으로 교체 ---
+
+        # center 추출
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(c)
+            if area > self.min_contour_area:
+                (x, y), radius = cv2.minEnclosingCircle(c)
+                center = (float(x), float(y))
+                cv2.circle(frame, (int(x), int(y)), int(radius), (0,255,0), 2)
+            else:
+                center = None
+        else:
+            center = None
+
+        # 칼만 초기화
+        if self.prev_center is None and center is not None:
+            self.kf.initialize(center[0], center[1])
+
+        # 예측
+        pred = self.kf.predict()    # (pred_x, pred_y) 또는 (None, None)
+
+        # 업데이트 / 미검출 시 예측값 사용
+        if center is not None:
+            filt_x, filt_y = self.kf.update(center[0], center[1])
+        else:
+            # 업데이트 없음 → 예측값 사용
+            if pred[0] is None:
+                # 아직 초기화가 안됐으면 그냥 스킵
+                filt_x, filt_y = None, None
+            else:
+                filt_x, filt_y = pred
+
+        # 프레임 간 이동량(px)
+        dx_px, dy_px = 0.0, 0.0
+        if filt_x is not None and self.prev_center is not None:
+            dx_px = filt_x - self.prev_center[0]
+            dy_px = filt_y - self.prev_center[1]
+
+        # 다음 프레임을 위해 저장
+        if filt_x is not None:
+            self.prev_center = (filt_x, filt_y)
+
+        # 텍스트 오버레이(선택)
+        if filt_x is not None and self.prev_center is not None:
+            frame = put_korean_text_on_cv2_image(
+                frame, f"X 이동량: {dx_px*self.PIXEL_TO_MM:.2f} mm", (10, 30),
+                korean_font, (255, 0, 0))
+            frame = put_korean_text_on_cv2_image(
+                frame, f"Y 이동량: {dy_px*self.PIXEL_TO_MM:.2f} mm", (10, 60),
+                korean_font, (0, 0, 255))
+
+
+        self.display_frame(frame)
+
+        self.current_frame_pos = self.frame_count
+
+        current_dx_mm = dx_px * self.PIXEL_TO_MM
+        current_dy_mm = dy_px * self.PIXEL_TO_MM
+
+        if self.frame_count == 0:
+            self.global_cumulative_x = [0.0]
+            self.global_cumulative_y = [0.0]
+
+        if len(self.global_cumulative_x) <= self.frame_count:
+            prev_x = self.global_cumulative_x[-1] if self.global_cumulative_x else 0.0
+            prev_y = self.global_cumulative_y[-1] if self.global_cumulative_y else 0.0
+            self.global_cumulative_x.append(prev_x + current_dx_mm)
+            self.global_cumulative_y.append(prev_y + current_dy_mm)
+        else:
+            prev_x = self.global_cumulative_x[self.frame_count - 1] if self.frame_count > 0 else 0.0
+            prev_y = self.global_cumulative_y[self.frame_count - 1] if self.frame_count > 0 else 0.0
+            self.global_cumulative_x[self.frame_count] = prev_x + current_dx_mm
+            self.global_cumulative_y[self.frame_count] = prev_y + current_dy_mm
+            self.global_cumulative_x = self.global_cumulative_x[:self.frame_count + 1]
+            self.global_cumulative_y = self.global_cumulative_y[:self.frame_count + 1]
+
+        if self.circle_center_x is not None and self.circle_center_y is not None and self.circle_radius is not None:
+            if self.global_cumulative_x and self.passed_judgment:
+                if (
+                    self.circle_center_x is not None and
+                    self.circle_center_y is not None and
+                    self.circle_radius is not None and
+                    self.frame_count >= self.judgment_warmup and
+                    len(self.global_cumulative_x) > 1 and
+                    self.passed_judgment
+                ):
+                    current_x_mm = self.global_cumulative_x[-1] - self.traj_x_offset
+                    current_y_mm = self.global_cumulative_y[-1] - self.traj_y_offset
+                    distance_from_center = math.hypot(current_x_mm - self.circle_center_x,
+                                                    current_y_mm - self.circle_center_y)
+
+                    # ★ 최대 이탈 거리 갱신
+                    if distance_from_center > self.max_distance_from_center:
+                        self.max_distance_from_center = distance_from_center
+
+                    if distance_from_center <= self.circle_radius:
+                        self.pass_fail_label.setText("판정 결과: 합격")
+                        self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: green;")
+                        self.pass_fail_result = "합격"   # ★ 문자열 저장
+                    else:
+                        self.pass_fail_label.setText("판정 결과: 불합격")
+                        self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: red;")
+                        self.passed_judgment = False
+                        self.pass_fail_result = "불합격"  # ★ 문자열 저장
+                    QApplication.processEvents()
+            elif not self.passed_judgment:
+                self.pass_fail_label.setText("판정 결과: 불합격")
+                self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: red;")
+                self.pass_fail_result = "불합격"  # ★ 유지
+            else:
+                self.pass_fail_label.setText("판정 결과: -")
+                self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: gray;")
+                self.pass_fail_result = "-"        # ★ 유지
+        else:
+            self.pass_fail_label.setText("판정 결과: -")
+            self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: gray;")
+            self.pass_fail_result = "-"            # ★ 유지
+
+
+        self.plot_widget.update_plot(
+            self.frame_count, dx_px, dy_px, self.PIXEL_TO_MM,
+            self.traj_x_offset, self.traj_y_offset,
+            ax1_ylim_min=self.ax1_ylim_min, ax1_ylim_max=self.ax1_ylim_max,
+            ax2_ylim_min=self.ax2_ylim_min, ax2_ylim_max=self.ax2_ylim_max,
+            ax3_xlim_min=self.ax3_xlim_min, ax3_xlim_max=self.ax3_xlim_max,
+            ax3_ylim_min=self.ax3_ylim_min, ax3_ylim_max=self.ax3_ylim_max,
+            ax1_xtick_interval=self.ax1_xtick_interval, ax1_ytick_interval=self.ax1_ytick_interval,
+            ax2_xtick_interval=self.ax2_xtick_interval, ax2_ytick_interval=self.ax2_ytick_interval,
+            ax3_xtick_interval=self.ax3_xtick_interval, ax3_ytick_interval=self.ax3_ytick_interval,
+            global_cumulative_x=self.global_cumulative_x,
+            global_cumulative_y=self.global_cumulative_y,
+            circle_center_x=self.circle_center_x,
+            circle_center_y=self.circle_center_y,
+            circle_radius=self.circle_radius
+        )
+
+        if not self.video_slider.isSliderDown():
+            self.video_slider.setValue(self.frame_count)
+            current_time_sec = self.frame_count / self.cap.get(cv2.CAP_PROP_FPS) if self.cap.get(cv2.CAP_PROP_FPS) > 0 else 0
+            self.current_time_label.setText(QTime(0, 0, 0).addSecs(int(current_time_sec)).toString("mm:ss"))
+
+    def display_frame(self, frame):
+        if frame is None:
+            print("로그: display_frame에 전달된 프레임이 None입니다. (여기까지 오면 안됨)")
+            return
+
+        try:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            print("로그: BGR2RGB 변환 성공.")
+        except cv2.error as e:
+            print(f"로그: BGR2RGB 변환 실패: {e}")
+            return
+
+        height, width, channel = rgb_frame.shape
+        bytes_per_line = 3 * width
+
+        qimg = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
+        if qimg.isNull():
+            print("로그: QImage 객체 생성 실패!")
+            return
+        print("로그: QImage 객체 생성 성공.")
+
+        label_width = self.video_display_label.width()
+        label_height = self.video_display_label.height()
+        print(f"로그: video_display_label의 현재 크기: W={label_width}, H={label_height}")
+
+        if label_width > 0 and label_height > 0:
+            self.video_display_label.setPixmap(QPixmap.fromImage(qimg).scaled(
+                label_width, label_height, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            print("로그: Pixmap이 QLabel에 성공적으로 설정됨 (스케일링 적용).")
+        else:
+            print("로그: video_display_label 크기가 유효하지 않습니다. 원본 Pixmap을 설정합니다.")
+            self.video_display_label.setPixmap(QPixmap.fromImage(qimg))
+            print("로그: Pixmap이 QLabel에 성공적으로 설정됨 (스케일링 없음).")
+
+        self.video_display_label.repaint()
+        print("로그: display_frame 호출 완료.")
+        self.update_fps_label()
+
+    def _render_calibration_overlay(self):
+        """
+        보정 모드에서 현재 찍힌 점들과 (있다면) 커서까지의 임시 선을 그려서 라벨에 표시.
+        """
+        if not self.calibrating or self.calibration_frame is None:
+            return
+        img = self.calibration_frame.copy()
+
+        # 찍힌 점들
+        for pt in self.calib_points:
+            cv2.circle(img, pt, 5, (0, 0, 255), -1)
+
+        # 선: (1) 점이 2개면 두 점을 잇는 확정 선 (2) 점이 1개고 커서 위치가 있으면 임시 선
+        if len(self.calib_points) >= 2:
+            p1 = self.calib_points[0]
+            p2 = self.calib_points[1]
+            cv2.line(img, p1, p2, (255, 0, 0), 2)  # 노란색
+        elif len(self.calib_points) == 1 and self._calib_hover_img_pos is not None:
+            p1 = self.calib_points[0]
+            p2 = self._calib_hover_img_pos
+            cv2.line(img, p1, p2, (255, 0, 0), 1)  # 임시선(밝은 노랑)
+
+        # 길이 텍스트(픽셀)
+        if len(self.calib_points) == 1 and self._calib_hover_img_pos is not None:
+            px = math.hypot(self._calib_hover_img_pos[0]-self.calib_points[0][0],
+                            self._calib_hover_img_pos[1]-self.calib_points[0][1])
+            cv2.putText(img, f"{px:.2f}px", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,0), 2, cv2.LINE_AA)
+        elif len(self.calib_points) >= 2:
+            p1, p2 = self.calib_points[:2]
+            px = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+            cv2.putText(img, f"{px:.2f}px", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,255), 2, cv2.LINE_AA)
+
+        # 라벨에 갱신
+        self.display_frame(img)
+
+    def _update_magnifier(self, img_x, img_y, global_pos):
+        """
+        (img_x, img_y) 주변을 확대해서 self.magnifier 라벨에 표시하고,
+        마우스 근처에 위치시킨다.
+        """
+        if self.calibration_frame is None:
+            return
+
+        # 크롭 영역 반경(원본 픽셀)
+        radius = int(self._magnifier_size / (2 * self._magnifier_zoom))
+        x1 = max(0, img_x - radius)
+        y1 = max(0, img_y - radius)
+        x2 = min(self.calibration_frame.shape[1], img_x + radius)
+        y2 = min(self.calibration_frame.shape[0], img_y + radius)
+
+        crop = self.calibration_frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return
+
+        # 확대
+        zoom = cv2.resize(crop, (self._magnifier_size, self._magnifier_size), interpolation=cv2.INTER_NEAREST)
+
+        # 십자선 그리기
+        cx = self._magnifier_size // 2
+        cy = self._magnifier_size // 2
+        cv2.line(zoom, (cx, 0), (cx, self._magnifier_size-1), (0, 255, 255), 1)
+        cv2.line(zoom, (0, cy), (self._magnifier_size-1, cy), (0, 255, 255), 1)
+
+        # 픽셀 좌표 텍스트
+        cv2.putText(zoom, f"({img_x},{img_y})", (6, self._magnifier_size-8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,255), 1, cv2.LINE_AA)
+
+        # QImage로 변환해 띄우기
+        rgb = cv2.cvtColor(zoom, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0], QImage.Format_RGB888)
+        self.magnifier.setPixmap(QPixmap.fromImage(qimg))
+
+        # 위치: 마우스 커서 오른쪽 아래(화면 밖 벗어나면 좌/위로 보정)
+        local_pos = self.video_container_widget.mapFromGlobal(global_pos)
+        mx = local_pos.x() + 16
+        my = local_pos.y() + 16
+
+        # 경계 보정
+        pw = self.video_container_widget.width()
+        ph = self.video_container_widget.height()
+        if mx + self._magnifier_size > pw:
+            mx = pw - self._magnifier_size - 4
+        if my + self._magnifier_size > ph:
+            my = ph - self._magnifier_size - 4
+
+        self.magnifier.move(mx, my)
+
+
+    def start_calibration(self):
+        print(f"로그: start_calibration 호출됨.")
+
+        self.was_playing_before_calib = self.video_playing
+        if self.timer.isActive():
+            print("로그: 타이머 활성화 상태. 타이머를 멈춥니다.")
+            self.timer.stop()
+
+        if self.cap is None:
+            QMessageBox.warning(self, "오류", "동영상을 먼저 열어주세요.")
+            return
+
+        ret, frame = self.cap.read()
+        self.calibration_frame = None
+        max_frames_to_skip = 100
+
+        for i in range(max_frames_to_skip):
+            if not ret:
+                print("경고: 캘리브레이션 프레임 캡처 실패. 동영상 끝이거나 오류.")
+                return
+            if np.sum(frame) > 1000:
+                self.calibration_frame = frame
+                print(f"로그: 캘리브레이션 프레임(비검은색)을 {i+1}번째 시도에서 찾았습니다.")
+                break
+            ret, frame = self.cap.read()
+
+        if self.calibration_frame is None:
+            QMessageBox.warning(self, "오류", "동영상 시작 부분이 모두 검은 화면입니다. 캘리브레이션을 시작할 수 없습니다.")
+            self.video_controls_overlay.show()
+            self.calibrating = False
+            return
+
+        self.calibrating = True
+        print(f"로그: self.calibrating = {self.calibrating} 설정됨.")
+
+        self.calib_points = []
+
+        # 포커스/마우스 설정
+        self.video_display_label.setFocusPolicy(Qt.StrongFocus)
+        print(f"로그: video_display_label.setFocusPolicy(Qt.StrongFocus) 설정 완료. 현재 포커스 정책: {self.video_display_label.focusPolicy()}")
+
+        self.video_display_label.setMouseTracking(True)
+        print(f"로그: video_display_label.setMouseTracking(True) 설정 완료. 현재 마우스 트래킹: {self.video_display_label.hasMouseTracking()}")
+
+        self.video_display_label.setCursor(Qt.CrossCursor)
+        print(f"로그: video_display_label.setCursor(Qt.CrossCursor) 설정 완료. 현재 커서 셰이프: {self.video_display_label.cursor().shape()}")
+
+        # ★★★ 보정 중엔 오버레이를 잠시 숨겨 간섭 제거 ★★★
+        self.video_controls_overlay.hide()
+
+        # 라벨을 최상단으로
+        self.video_display_label.raise_()
+        print("로그: video_display_label을 맨 위로 올림.")
+
+        if not hasattr(self, '_orig_mouse_press_event') or self._orig_mouse_press_event is None:
+            self._orig_mouse_press_event = self.video_display_label.mousePressEvent
+            print(f"로그: _orig_mouse_press_event 저장 완료: {self._orig_mouse_press_event}")
+        else:
+            print(f"로그: _orig_mouse_press_event 이미 저장되어 있음: {self._orig_mouse_press_event}")
+
+        self.video_display_label.mousePressEvent = self.get_calib_point
+        print(f"로그: video_display_label.mousePressEvent를 get_calib_point로 설정 완료: {self.video_display_label.mousePressEvent}")
+
+        print(f"로그: video_display_label.isEnabled(): {self.video_display_label.isEnabled()}")
+        print(f"로그: video_display_label.isVisible(): {self.video_display_label.isVisible()}")
+        print(f"로그: video_display_label.geometry(): {self.video_display_label.geometry()}")
+        print(f"로그: video_display_label.mapToGlobal(QPoint(0,0)): {self.video_display_label.mapToGlobal(QPoint(0,0))}")
+
+        self.video_display_label.installEventFilter(self)
+        print("로그: video_display_label에 이벤트 필터 설치 완료.")
+
+        self.video_display_parent_widget = self.video_display_label.parent()
+        if self.video_display_parent_widget:
+            self.video_display_parent_widget.installEventFilter(self)
+            print(f"로그: 부모 위젯 ({self.video_display_parent_widget.__class__.__name__})에도 이벤트 필터 설치 완료.")
+        else:
+            print("로그: video_display_label의 부모 위젯을 찾을 수 없습니다.")
+
+        self.display_frame(self.calibration_frame)
+        self.video_display_label.repaint()
+        QCoreApplication.processEvents()
+        print("로그: 캘리브레이션 프레임 표시 후 UI 갱신 강제.")
+
+        QMessageBox.information(self, "스케일 보정 시작", "영상 영역에 첫 번째 점을 클릭하세요.")
+        print(f"로그: 스케일 보정 모드 시작. 첫 점 클릭 대기 중.")
+
+        # 돋보기 활성화
+        self.magnifier.show()
+
+    # NEW
+    def _snap_to_axis(self, p1, p2):
+        x1, y1 = p1
+        x2, y2 = p2
+        if abs(x2 - x1) >= abs(y2 - y1):
+            return (x2, y1)  # 수평 스냅
+        else:
+            return (x1, y2)  # 수직 스냅
+
+
+    # 이벤트 필터 (로깅 전용)
+    def eventFilter(self, obj, event):
+        # 라벨 또는 부모에서 오는 이벤트를 감시
+        watching = (obj == self.video_display_label) or (hasattr(self, 'video_display_parent_widget') and obj == self.video_display_parent_widget)
+        if watching:
+            if event.type() == QEvent.MouseMove and self.calibrating and self.calibration_frame is not None:
+                # 1) 라벨 좌표 -> 이미지 좌표 변환
+                label_size = self.video_display_label.size()
+                if label_size.width() > 0 and label_size.height() > 0:
+                    img_h, img_w = self.calibration_frame.shape[:2]
+                    img_aspect = img_w / img_h
+                    label_aspect = label_size.width() / label_size.height()
+                    if img_aspect > label_aspect:
+                        scaled_w = label_size.width()
+                        scaled_h = int(scaled_w / img_aspect)
+                        offset_x = 0
+                        offset_y = (label_size.height() - scaled_h) / 2
+                    else:
+                        scaled_h = label_size.height()
+                        scaled_w = int(scaled_h * img_aspect)
+                        offset_y = 0
+                        offset_x = (label_size.width() - scaled_w) / 2
+
+                    if scaled_w > 0 and scaled_h > 0:
+                        # 라벨 좌표계
+                        lx, ly = event.pos().x(), event.pos().y()
+                        # 이미지 좌표로 매핑
+                        img_x = int((lx - offset_x) / (scaled_w / img_w))
+                        img_y = int((ly - offset_y) / (scaled_h / img_h))
+                    
+                        # CHANGED: 아래 블록으로 교체 (중복 설정/중복 렌더 제거)
+                        if 0 <= img_x < img_w and 0 <= img_y < img_h:
+                            hover = (img_x, img_y)
+
+                            # Shift 스냅
+                            if self.calib_points and (event.modifiers() & Qt.ShiftModifier):
+                                hover = self._snap_to_axis(self.calib_points[0], hover)
+
+                            # 한 번만 설정/렌더/돋보기
+                            self._calib_hover_img_pos = hover
+                            self._render_calibration_overlay()
+                            self._update_magnifier(hover[0], hover[1], event.globalPos())
+
+            # (기존 로깅 원하면 유지)
+        return super().eventFilter(obj, event)
+
+
+    def get_calib_point(self, event):
+        print(f"로그: get_calib_point 호출됨. 이벤트 버튼: {event.button()}, 캘리브레이션 상태: {self.calibrating}")
+
+        if not self.calibrating:
+            print("로그: get_calib_point - 캘리브레이션 모드가 아님. 무시.")
+            return
+
+        if event.button() != Qt.LeftButton:
+            print(f"로그: get_calib_point - 왼쪽 버튼이 아님 ({event.button()}). 무시.")
+            return
+
+        if self.calibration_frame is None:
+            print("경고: calibration_frame이 없습니다. 클릭 무시.")
+            return
+
+        label_size = self.video_display_label.size()
+        if label_size.width() == 0 or label_size.height() == 0:
+            print("경고: get_calib_point - QLabel 크기가 0입니다. 클릭 무시.")
+            return
+
+        pixmap = self.video_display_label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            print("경고: pixmap이 유효하지 않습니다. 클릭 무시.")
+            return
+
+        img_h, img_w = self.calibration_frame.shape[:2]
+        img_aspect_ratio = img_w / img_h
+        label_aspect_ratio = label_size.width() / label_size.height()
+
+        if img_aspect_ratio > label_aspect_ratio:
+            scaled_w = label_size.width()
+            scaled_h = int(scaled_w / img_aspect_ratio)
+            offset_x = 0
+            offset_y = (label_size.height() - scaled_h) / 2
+        else:
+            scaled_h = label_size.height()
+            scaled_w = int(scaled_h * img_aspect_ratio)
+            offset_y = 0
+            offset_x = (label_size.width() - scaled_w) / 2
+
+        if scaled_w == 0 or scaled_h == 0:
+            print("경고: 스케일링된 이미지 크기가 0입니다. 클릭 무시.")
+            return
+
+        img_x = int((event.pos().x() - offset_x) / (scaled_w / img_w))
+        img_y = int((event.pos().y() - offset_y) / (scaled_h / img_h))
+
+        # CHANGED: 좌표 산출 후 아래 블록으로 교체
+        if 0 <= img_x < img_w and 0 <= img_y < img_h:
+            candidate = (img_x, img_y)
+
+            # Shift가 눌려 있고, 현재 1번째 점이 있는 상태(=두 번째 점을 찍을 때)면 스냅
+            if len(self.calib_points) == 1 and (event.modifiers() & Qt.ShiftModifier):
+                candidate = self._snap_to_axis(self.calib_points[0], candidate)
+
+                # 스냅된 좌표도 이미지 범위로 클램프(옵션)
+                cx = min(max(candidate[0], 0), img_w - 1)
+                cy = min(max(candidate[1], 0), img_h - 1)
+                candidate = (cx, cy)
+
+            # 한 번만 append
+            self.calib_points.append(candidate)
+            print(f"로그: 클릭된 점(스냅 반영): {candidate}. 현재 {len(self.calib_points)}개 점.")
+        else:
+            QMessageBox.warning(self, "경고", "이미지 영역 밖을 클릭했습니다. 다시 클릭해주세요.")
+            print(f"경고: 이미지 영역 밖 클릭: ({event.pos().x()}, {event.pos().y()}) -> ({img_x}, {img_y})")
+            return
+
+        self._render_calibration_overlay()
+
+        if len(self.calib_points) == 2:
+            p1, p2 = self.calib_points
+            px_dist = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            print(f"로그: 두 번째 점 클릭. 픽셀 거리: {px_dist:.2f}")
+
+            if px_dist == 0:
+                QMessageBox.warning(self, "오류", "두 점이 동일합니다. 다시 클릭해주세요.")
+                print("오류: 두 점이 동일합니다.")
+                self.calib_points.clear()
+                self.video_display_label.setText("스케일 보정: 첫 점을 다시 클릭하세요")
+                self.display_frame(self.calibration_frame)
+                return
+
+            real_dist, ok = QInputDialog.getDouble(
+                self, "실제 길이 입력",
+                f"픽셀 거리: {px_dist:.2f} px\n실제 거리(mm)를 입력하세요:",
+                decimals=3, min=0.001)
+
+            if ok and real_dist > 0:
+                self.PIXEL_TO_MM = real_dist / px_dist
+                self.video_display_label.setText(f"스케일 보정 완료: 1 px = {self.PIXEL_TO_MM:.5f} mm")
+                QMessageBox.information(self, "스케일 보정", f"1 픽셀 당 {self.PIXEL_TO_MM:.5f} mm로 설정되었습니다.")
+                print(f"로그: 스케일 보정 완료. 1px = {self.PIXEL_TO_MM:.5f} mm")
+            else:
+                self.video_display_label.setText("스케일 보정 취소됨")
+                QMessageBox.information(self, "스케일 보정", "스케일 보정이 취소되었습니다.")
+                print("로그: 스케일 보정 취소됨.")
+
+            # 거리 계산 후(OK/취소 여부와 무관)
+            self._render_calibration_overlay()
+
+            self.magnifier.hide()
+
+            # --- 캘리브레이션 종료 및 UI 복구 ---
+            self.calibrating = False
+            self.calib_points.clear()
+            self.calibration_frame = None
+
+            self.video_display_label.setCursor(Qt.ArrowCursor)
+            self.video_display_label.mousePressEvent = self._orig_mouse_press_event
+            self._orig_mouse_press_event = None
+
+            # ★★★ 보정 종료 후 오버레이 다시 표시 ★★★
+            self.video_controls_overlay.show()
+            self.video_controls_overlay.raise_()   # <-- 이 줄 추가 (오버레이를 최상단으로)
+
+            # ▼ 여기에 추가
+            if hasattr(self, 'video_display_parent_widget') and self.video_display_parent_widget:
+                self.video_display_parent_widget.removeEventFilter(self)
+
+            self.video_display_label.removeEventFilter(self)
+
+            if self.was_playing_before_calib:
+                self.play_pause_video()
+            else:
+                current_pos = self.cap.get(cv2.CAP_PROP_POS_FRAMES)
+                if current_pos > 0:
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, current_pos - 1)
+                ret, frame = self.cap.read()
+                if ret:
+                    self.display_frame(frame)
+                else:
+                    self.video_display_label.setText("동영상을 선택하세요")
+                    self.video_display_label.setStyleSheet("background-color: black;")
+
+    def save_to_xlsx(self):
+        if not self.global_cumulative_x or not self.global_cumulative_y:
+            QMessageBox.warning(self, "저장 실패", "저장할 데이터가 없습니다. 동영상을 분석한 후 시도해주세요.")
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(self, "XLSX 저장", "xy_displacement_mm.xlsx", "Excel Files (*.xlsx)")
+        if not filename:
+            return
+
+        try:
+            # 데이터 준비
+            x_data = np.array(self.global_cumulative_x)
+            y_data = np.array(self.global_cumulative_y)
+            frame_numbers = np.arange(1, len(x_data) + 1)
+            distances = np.sqrt(x_data ** 2 + y_data ** 2)
+
+            # 시작-마지막 점 차이
+            start_x, start_y = x_data[0], y_data[0]
+            end_x, end_y = x_data[-1], y_data[-1]
+            final_diff = math.hypot(end_x - start_x, end_y - start_y)
+
+            # 합/불
+            judgement = self.pass_fail_result
+
+            # Workbook 생성
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Tracking Data"
+
+            # 메인 테이블 (A1~D...)
+            ws.append(['Frame', 'X_cumulative_mm', 'Y_cumulative_mm', 'Distance_from_Origin_mm'])
+            for i in range(len(frame_numbers)):
+                ws.append([int(frame_numbers[i]),
+                        round(x_data[i], 5),
+                        round(y_data[i], 5),
+                        round(distances[i], 5)])
+
+            # F2~G4에 항목/값 입력
+            ws['F2'] = "최대 중심 이탈 거리 (mm)"
+            ws['G2'] = round(self.max_distance_from_center, 3)
+
+            ws['F3'] = "시작-마지막 점 차이 (mm)"
+            ws['G3'] = round(final_diff, 3)
+
+            ws['F4'] = "합/불"
+            ws['G4'] = judgement
+
+            # 저장
+            wb.save(filename)
+            QMessageBox.information(self, "저장 완료", f"데이터가 '{filename}' 에 저장되었습니다.")
+
+        except Exception as e:
+            QMessageBox.critical(self, "저장 실패", f"파일 저장 중 오류가 발생했습니다:\n{str(e)}")
+
+
+
+    def set_trajectory_origin(self):
+        if not self.global_cumulative_x or not self.global_cumulative_y:
+            QMessageBox.warning(self, "경고", "추적 데이터가 없습니다. 동영상을 재생하여 객체를 추적한 후 시도해주세요.")
+            return
+
+        self.traj_x_offset = self.global_cumulative_x[-1]
+        self.traj_y_offset = self.global_cumulative_y[-1]
+        QMessageBox.information(self, "궤적 원점 설정",
+                                f"현재 위치 ({self.traj_x_offset:.2f}mm, {self.traj_y_offset:.2f}mm)를 궤적의 새 원점으로 설정했습니다.")
+        self.update_all_plots()
+
+
+    def parse_float_input(self, line_edit):
+        try:
+            text = line_edit.text()
+            if text:
+                value = float(text)
+                return value
+            return None
+        except ValueError:
+            QMessageBox.warning(self, "입력 오류", f"'{text}'는 유효한 숫자가 아닙니다. 숫자만 입력해주세요.")
+            line_edit.clear()
+            return None
+
+    def parse_int_input(self, line_edit):
+        try:
+            text = line_edit.text()
+            if text:
+                value = int(text)
+                if value < 0:
+                    QMessageBox.warning(self, "입력 오류", "프레임 번호는 음수가 될 수 없습니다.")
+                    line_edit.clear()
+                    return None
+                return value
+            return None
+        except ValueError:
+            QMessageBox.warning(self, "입력 오류", f"'{text}'는 유효한 정수가 아닙니다. 정수만 입력해주세요.")
+            line_edit.clear()
+            return None
+
+    def apply_fps_setting(self):
+        new_fps = self.parse_float_input(self.fps_input)
+        if new_fps is not None:
+            self._set_playback_fps(new_fps, show_warning=True)
+
+    def increase_fps(self):
+        self._set_playback_fps(self.current_fps + 5)
+
+    def decrease_fps(self):
+        self._set_playback_fps(self.current_fps - 5)
+
+    def play_pause_video(self):
+        if self.cap is None:
+            QMessageBox.warning(self, "경고", "먼저 동영상을 열어주세요.")
+            return
+
+        if self.timer.isActive():
+            self.timer.stop()
+            self.video_playing = False
+            self.play_pause_button.setText("재생")
+            QMessageBox.information(self, "재생/일시정지", "영상이 일시정지되었습니다.")
+        else:
+            self.timer.start(int(1000 / self.current_fps))
+            if hasattr(self, "kf"):
+                self.kf.set_dt(1.0 / self.current_fps)  # ✅ 추가
+            self.video_playing = True
+            self.play_pause_button.setText("일시정지")
+            QMessageBox.information(self, "재생/일시정지", "영상이 재생됩니다.")
+
+    def stop_reset_video(self):
+        self.timer.stop()
+        self.video_playing = False
+        self.play_pause_button.setText("재생")
+
+        if self.cap:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.frame_count = 0
+            self.plot_widget.x_disp_data.clear()
+            self.plot_widget.y_disp_data.clear()
+            self.plot_widget.frame_idx.clear()
+            self.global_cumulative_x = [0.0]
+            self.global_cumulative_y = [0.0]
+            self.traj_x_offset = 0.0
+            self.traj_y_offset = 0.0
+
+            ret, frame = self.cap.read()
+            if ret:
+                self.display_frame(frame)
+            else:
+                self.video_display_label.setStyleSheet("background-color: black;")
+                self.video_display_label.setText("동영상을 선택하세요")
+
+            self.plot_widget.ax1.autoscale_view(True, True, True)
+            self.plot_widget.ax2.autoscale_view(True, True, True)
+            self.plot_widget.ax3.set_xlim(self.ax3_xlim_min, self.ax3_xlim_max)
+            self.plot_widget.ax3.set_ylim(self.ax3_ylim_min, self.ax3_ylim_max)
+            self.plot_widget.ax3.set_aspect('equal', adjustable='box')
+            self.plot_widget.canvas.draw_idle()
+
+            self.passed_judgment = True
+            self.pass_fail_label.setText("판정 결과: -")
+            self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: gray;")
+            self.current_time_label.setText("00:00")
+            self.video_slider.setValue(0)
+
+            QMessageBox.information(self, "정지/초기화", "영상이 정지되고 모든 데이터가 초기화되었습니다.")
+        else:
+            QMessageBox.information(self, "정지/초기화", "재생 중인 동영상이 없습니다.")
+
+        self.max_distance_from_center = 0.0
+        self.pass_fail_result = "-"        
+
+        self.plot_widget.lock_ax3 = False
+
+        self.prev_center = None
+        self.kf.reset()
+            
+    def go_to_frame(self):
+        if self.cap is None:
+            QMessageBox.warning(self, "경고", "먼저 동영상을 열어주세요.")
+            return
+
+        target_frame = self.parse_int_input(self.frame_seek_input)
+        if target_frame is None:
+            return
+
+        total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if target_frame >= total_frames:
+            QMessageBox.warning(self, "입력 오류", f"입력한 프레임 번호({target_frame})가 총 프레임 수({total_frames})를 초과합니다.")
+            self.frame_seek_input.clear()
+            return
+
+        was_playing = self.video_playing
+        if was_playing:
+            self.play_pause_video()  # 일시정지
+
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        self.frame_count = target_frame
+        self.prev_center = None
+        self.kf.reset()
+        self.plot_widget.x_disp_data.clear()
+        self.plot_widget.y_disp_data.clear()
+        self.plot_widget.frame_idx.clear()
+        self.global_cumulative_x = [0.0]
+        self.global_cumulative_y = [0.0]
+        self.traj_x_offset = 0.0
+        self.traj_y_offset = 0.0
+
+        ret, frame = self.cap.read()
+        if ret:
+            self.display_frame(frame)
+
+            self.plot_widget.ax1.autoscale_view(True, True, True)
+            self.plot_widget.ax2.autoscale_view(True, True, True)
+            self.plot_widget.ax3.set_xlim(self.ax3_xlim_min, self.ax3_xlim_max)
+            self.plot_widget.ax3.set_ylim(self.ax3_ylim_min, self.ax3_ylim_max)
+            self.plot_widget.ax3.set_aspect('equal', adjustable='box')
+
+            self.plot_widget.update_plot(
+                self.frame_count, 0, 0, self.PIXEL_TO_MM,
+                self.traj_x_offset, self.traj_y_offset,
+                ax1_ylim_min=self.ax1_ylim_min, ax1_ylim_max=self.ax1_ylim_max,
+                ax2_ylim_min=self.ax2_ylim_min, ax2_ylim_max=self.ax2_ylim_max,
+                ax3_xlim_min=self.ax3_xlim_min, ax3_xlim_max=self.ax3_xlim_max,
+                ax3_ylim_min=self.ax3_ylim_min, ax3_ylim_max=self.ax3_ylim_max,
+                ax1_xtick_interval=self.ax1_xtick_interval, ax1_ytick_interval=self.ax1_ytick_interval,
+                ax2_xtick_interval=self.ax2_xtick_interval, ax2_ytick_interval=self.ax2_ytick_interval,
+                ax3_xtick_interval=self.ax3_xtick_interval, ax3_ytick_interval=self.ax3_ytick_interval,
+                global_cumulative_x=self.global_cumulative_x,
+                global_cumulative_y=self.global_cumulative_y,
+                circle_center_x=self.circle_center_x,
+                circle_center_y=self.circle_center_y,
+                circle_radius=self.circle_radius
+            )
+            self.passed_judgment = True
+            self.pass_fail_label.setText("판정 결과: -")
+            self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: gray;")
+            self.video_slider.setValue(self.frame_count)
+            current_time_sec = self.frame_count / self.cap.get(cv2.CAP_PROP_FPS) if self.cap.get(cv2.CAP_PROP_FPS) > 0 else 0
+            self.current_time_label.setText(QTime(0, 0, 0).addSecs(int(current_time_sec)).toString("mm:ss"))
+
+            QMessageBox.information(self, "프레임 이동", f"{target_frame} 프레임으로 이동했습니다. 추적 데이터가 초기화됩니다.")
+
+            if was_playing:
+                self.timer.start(int(1000 / self.current_fps))
+                self.video_playing = True
+                self.play_pause_button.setText("일시정지")
+
+        else:
+            QMessageBox.warning(self, "오류", "해당 프레임으로 이동할 수 없습니다.")
+            self.cap.release()
+            self.cap = None
+            self.calibration_frame = None
+            self.video_display_label.setStyleSheet("background-color: black;")
+            self.video_display_label.setText("동영상을 선택하세요")
+
+    def set_position(self, position):
+        if self.cap is not None:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, position)
+            self.frame_count = position
+            self.plot_widget.x_disp_data.clear()
+            self.plot_widget.y_disp_data.clear()
+            self.plot_widget.frame_idx.clear()
+            self.global_cumulative_x = [0.0]
+            self.global_cumulative_y = [0.0]
+            self.traj_x_offset = 0.0
+            self.traj_y_offset = 0.0
+
+            current_time_sec = self.frame_count / self.cap.get(cv2.CAP_PROP_FPS) if self.cap.get(cv2.CAP_PROP_FPS) > 0 else 0
+            self.current_time_label.setText(QTime(0, 0, 0).addSecs(int(current_time_sec)).toString("mm:ss"))
+
+            ret, frame = self.cap.read()
+            if ret:
+                self.display_frame(frame)
+                self.update_all_plots()
+                self.passed_judgment = True
+                self.pass_fail_label.setText("판정 결과: -")
+                self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: gray;")
+
+                if self.was_playing_before_calib:
+                    self.timer.start(int(1000 / self.current_fps))
+                    self.video_playing = True
+                    self.play_pause_button.setText("일시정지")
+            else:
+                print("경고: 슬라이더 이동 후 프레임을 읽을 수 없습니다.")
+
+        self.prev_center = None
+        self.kf.reset()
+
+    def pause_on_slider_press(self):
+        if self.video_playing:
+            self.timer.stop()
+            self.play_pause_button.setText("재생")
+            self.was_playing_before_calib = True
+        else:
+            self.was_playing_before_calib = False
+
+    def resume_on_slider_release(self):
+        if self.was_playing_before_calib:
+            self.timer.start(int(1000 / self.current_fps))
+            self.kf.set_dt(1.0 / self.current_fps)   # <-- NEW
+            self.video_playing = True
+            self.play_pause_button.setText("일시정지")
+            self.update_fps_label()  # << 추가
+        self.was_playing_before_calib = False
+
+    def update_all_plots(self):
+        current_frame_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) if self.cap else 0
+        self.plot_widget.update_plot(
+            current_frame_pos, 0, 0, self.PIXEL_TO_MM,
+            self.traj_x_offset, self.traj_y_offset,
+            ax1_ylim_min=self.ax1_ylim_min, ax1_ylim_max=self.ax1_ylim_max,
+            ax2_ylim_min=self.ax2_ylim_min, ax2_ylim_max=self.ax2_ylim_max,
+            ax3_xlim_min=self.ax3_xlim_min, ax3_xlim_max=self.ax3_xlim_max,
+            ax3_ylim_min=self.ax3_ylim_min, ax3_ylim_max=self.ax3_ylim_max,
+            ax1_xtick_interval=self.ax1_xtick_interval, ax1_ytick_interval=self.ax1_ytick_interval,
+            ax2_xtick_interval=self.ax2_xtick_interval, ax2_ytick_interval=self.ax2_ytick_interval,
+            ax3_xtick_interval=self.ax3_xtick_interval, ax3_ytick_interval=self.ax3_ytick_interval,
+            global_cumulative_x=self.global_cumulative_x,
+            global_cumulative_y=self.global_cumulative_y,
+            circle_center_x=self.circle_center_x,
+            circle_center_y=self.circle_center_y,
+            circle_radius=self.circle_radius
+        )
+
+    def apply_ax1_ylim(self):
+        self.ax1_ylim_min = self.parse_float_input(self.ax1_ylim_min_input)
+        self.ax1_ylim_max = self.parse_float_input(self.ax1_ylim_max_input)
+
+        if self.ax1_ylim_min is not None and self.ax1_ylim_max is not None and self.ax1_ylim_min >= self.ax1_ylim_max:
+            QMessageBox.warning(self, "입력 오류", "X 이동량 Y축의 최소값이 최대값보다 크거나 같을 수 없습니다.")
+            self.ax1_ylim_min_input.clear()
+            self.ax1_ylim_max_input.clear()
+            self.ax1_ylim_min = None
+            self.ax1_ylim_max = None
+            return
+
+        self.update_all_plots()
+
+        self.plot_widget.lock_ax1 = True   # <- 추가
+
+    def apply_ax1_xtick_interval(self):
+        self.ax1_xtick_interval = self.parse_float_input(self.ax1_xtick_interval_input)
+        self.update_all_plots()
+        self.plot_widget.lock_ax1 = True   # <- 추가
+
+    def apply_ax1_ytick_interval(self):
+        self.ax1_ytick_interval = self.parse_float_input(self.ax1_ytick_interval_input)
+        self.update_all_plots()
+        self.plot_widget.lock_ax1 = True   # <- 추가
+
+    def apply_ax2_ylim(self):
+        self.ax2_ylim_min = self.parse_float_input(self.ax2_ylim_min_input)
+        self.ax2_ylim_max = self.parse_float_input(self.ax2_ylim_max_input)
+
+        if self.ax2_ylim_min is not None and self.ax2_ylim_max is not None and self.ax2_ylim_min >= self.ax2_ylim_max:
+            QMessageBox.warning(self, "입력 오류", "Y 이동량 Y축의 최소값이 최대값보다 크거나 같을 수 없습니다.")
+            self.ax2_ylim_min_input.clear()
+            self.ax2_ylim_max_input.clear()
+            self.ax2_ylim_min = None
+            self.ax2_ylim_max = None
+            return
+
+        self.update_all_plots()
+        self.plot_widget.lock_ax2 = True   # <- 추가
+
+    def apply_ax2_xtick_interval(self):
+        self.ax2_xtick_interval = self.parse_float_input(self.ax2_xtick_interval_input)
+        self.update_all_plots()
+        self.plot_widget.lock_ax2 = True   # <- 추가
+
+    def apply_ax2_ytick_interval(self):
+        self.ax2_ytick_interval = self.parse_float_input(self.ax2_ytick_interval_input)
+        self.update_all_plots()
+        self.plot_widget.lock_ax2 = True   # <- 추가
+
+    def apply_ax3_xlim(self):
+        self.ax3_xlim_min = self.parse_float_input(self.ax3_xlim_min_input)
+        self.ax3_xlim_max = self.parse_float_input(self.ax3_xlim_max_input)
+
+        if self.ax3_xlim_min is not None and self.ax3_xlim_max is not None and self.ax3_xlim_min >= self.ax3_xlim_max:
+            QMessageBox.warning(self, "입력 오류", "XY 궤적 X축의 최소값이 최대값보다 크거나 같을 수 없습니다.")
+            self.ax3_xlim_min_input.clear()
+            self.ax3_xlim_max_input.clear()
+            self.ax3_xlim_min = None
+            self.ax3_xlim_max = None
+            return
+
+        self.update_all_plots()
+        self.plot_widget.lock_ax3 = True   # <- 추가
+
+    def apply_ax3_ylim(self):
+        self.ax3_ylim_min = self.parse_float_input(self.ax3_ylim_min_input)
+        self.ax3_ylim_max = self.parse_float_input(self.ax3_ylim_max_input)
+
+        if self.ax3_ylim_min is not None and self.ax3_ylim_max is not None and self.ax3_ylim_min >= self.ax3_ylim_max:
+            QMessageBox.warning(self, "입력 오류", "XY 궤적 Y축의 최소값이 최대값보다 크거나 같을 수 없습니다.")
+            self.ax3_ylim_min_input.clear()
+            self.ax3_ylim_max_input.clear()
+            self.ax3_ylim_min = None
+            self.ax3_ylim_max = None
+            return
+
+        self.update_all_plots()
+        self.plot_widget.lock_ax3 = True   # <- 추가
+
+    def apply_ax3_xtick_interval(self):
+        self.ax3_xtick_interval = self.parse_float_input(self.ax3_xtick_interval_input)
+        self.update_all_plots()
+        self.plot_widget.lock_ax3 = True   # <- 추가
+
+    def apply_ax3_ytick_interval(self):
+        self.ax3_ytick_interval = self.parse_float_input(self.ax3_ytick_interval_input)
+        self.update_all_plots()
+        self.plot_widget.lock_ax3 = True   # <- 추가
+
+    def reset_axis_limits_ui_only(self):
+        self.ax1_ylim_min_input.clear()
+        self.ax1_ylim_max_input.clear()
+        self.ax1_xtick_interval_input.clear()
+        self.ax1_ytick_interval_input.clear()
+
+        self.ax2_ylim_min_input.clear()
+        self.ax2_ylim_max_input.clear()
+        self.ax2_xtick_interval_input.clear()
+        self.ax2_ytick_interval_input.clear()
+
+        self.ax3_xlim_min_input.clear()
+        self.ax3_xlim_max_input.clear()
+        self.ax3_ylim_min_input.clear()
+        self.ax3_ylim_max_input.clear()
+        self.ax3_xtick_interval_input.clear()
+        self.ax3_ytick_interval_input.clear()
+
+        self.fps_input.clear()
+        self.fps_input.setPlaceholderText(f"예: 30 (자동)")
+
+        self.frame_seek_input.clear()
+
+        self.ax1_ylim_min = None
+        self.ax1_ylim_max = None
+        self.ax1_xtick_interval = None
+        self.ax1_ytick_interval = None
+
+        self.ax2_ylim_min = None
+        self.ax2_ylim_max = None
+        self.ax2_xtick_interval = None
+        self.ax2_ytick_interval = None
+
+        self.ax3_xlim_min = -10.0
+        self.ax3_xlim_max = 10.0
+        self.ax3_ylim_min = -10.0
+        self.ax3_ylim_max = 10.0
+        self.ax3_xtick_interval = None
+        self.ax3_ytick_interval = None
+
+        self.current_fps = 30.0
+
+        self.circle_center_x_input.clear()
+        self.circle_center_y_input.clear()
+        self.circle_radius_input.clear()
+        self.circle_center_x_input.setPlaceholderText("0.0")
+        self.circle_center_y_input.setPlaceholderText("0.0")
+        self.circle_radius_input.setPlaceholderText("2.0")
+        self.circle_center_x = 0.0
+        self.circle_center_y = 0.0
+        self.circle_radius = 2.0
+
+    def reset_axis_limits(self):
+        self.reset_axis_limits_ui_only()
+        self.timer.setInterval(int(1000 / self.current_fps))
+
+        self.plot_widget.ax1.autoscale_view(True, True, True)
+        self.plot_widget.ax2.autoscale_view(True, True, True)
+        self.plot_widget.ax3.set_xlim(self.ax3_xlim_min, self.ax3_xlim_max)
+        self.plot_widget.ax3.set_ylim(self.ax3_ylim_min, self.ax3_ylim_max)
+        self.plot_widget.ax3.set_aspect('equal', adjustable='box')
+        self.plot_widget.canvas.draw_idle()
+
+        QMessageBox.information(self, "축 범위 초기화", "모든 그래프 축 범위 및 간격이 자동으로 설정되도록 초기화되었습니다.")
+
+        # 뷰 락 해제
+        self.plot_widget.lock_ax1 = False
+        self.plot_widget.lock_ax2 = False
+        self.plot_widget.lock_ax3 = False
+
+    def apply_circle_criteria(self):
+        center_x = self.parse_float_input(self.circle_center_x_input)
+        center_y = self.parse_float_input(self.circle_center_y_input)
+        radius = self.parse_float_input(self.circle_radius_input)
+
+        if radius is not None and radius <= 0:
+            QMessageBox.warning(self, "입력 오류", "원 반지름은 양수여야 합니다.")
+            self.circle_radius_input.clear()
+            return
+
+        if center_x is not None and center_y is not None and radius is not None:
+            self.circle_center_x = center_x
+            self.circle_center_y = center_y
+            self.circle_radius = radius
+            QMessageBox.information(self, "기준 적용", f"원형 기준선이 중심 ({center_x:.2f}, {center_y:.2f}), 반지름 {radius:.2f} mm로 설정되었습니다.")
+        else:
+            self.circle_center_x = 0.0
+            self.circle_center_y = 0.0
+            self.circle_radius = 2.0
+            QMessageBox.warning(self, "입력 오류", "원형 기준선 값을 올바르게 입력해주세요. 기본값으로 설정됩니다.")
+
+        self.update_all_plots()
+
+class KalmanCV2D:
+    def __init__(self, dt=1/30.0, process_var=1e-2, measurement_var=5.0):
+        self.dt = dt
+        self.process_var = process_var
+        self.measurement_var = measurement_var
+        self._build_matrices()
+        self.x = None
+        self.P = None
+
+    def _build_matrices(self):
+        dt = self.dt
+        self.F = np.array([[1, 0, dt, 0],
+                           [0, 1, 0,  dt],
+                           [0, 0, 1,  0],
+                           [0, 0, 0,  1]], dtype=float)
+        q = self.process_var
+        dt2 = dt*dt/2
+        self.Q = q * np.array([[dt2, 0,   dt,  0],
+                               [0,   dt2, 0,   dt],
+                               [dt,  0,   1,   0],
+                               [0,   dt,  0,   1]], dtype=float)
+        self.H = np.array([[1,0,0,0],
+                           [0,1,0,0]], dtype=float)
+        r = self.measurement_var
+        self.R = np.array([[r,0],[0,r]], dtype=float)
+        self.I = np.eye(4)
+
+    def set_dt(self, dt):
+        self.dt = dt
+        self._build_matrices()
+
+    def initialize(self, x, y):
+        self.x = np.array([[x],[y],[0.0],[0.0]], dtype=float)
+        self.P = np.eye(4) * 100.0
+
+    def reset(self):
+        self.x = None
+        self.P = None
+
+    def predict(self):
+        if self.x is None:
+            return None, None
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        return float(self.x[0,0]), float(self.x[1,0])
+
+    def update(self, z_x, z_y):
+        if self.x is None:
+            self.initialize(z_x, z_y)
+            return z_x, z_y
+        z = np.array([[z_x],[z_y]], dtype=float)
+        y = z - (self.H @ self.x)
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (self.I - K @ self.H) @ self.P
+        return float(self.x[0,0]), float(self.x[1,0])
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = ColorTrackerApp()
+    window.show()
+    sys.exit(app.exec_())
