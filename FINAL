@@ -8,11 +8,14 @@ import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import matplotlib.ticker as ticker
+from collections import deque
 
+
+from matplotlib.lines import Line2D
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QFileDialog, QInputDialog, QSizePolicy, QMessageBox,
-    QLineEdit, QGridLayout, QGroupBox, QSlider, QMainWindow
+    QLineEdit, QGridLayout, QGroupBox, QSlider, QMainWindow, QCheckBox
 )
 from PyQt5.QtCore import QTimer, Qt, QTime, QCoreApplication, QEvent, QPoint
 from PyQt5.QtGui import QImage, QPixmap
@@ -25,7 +28,6 @@ import matplotlib.patches as patches
 
 from PIL import ImageFont, ImageDraw, Image
 from openpyxl import Workbook
-
 
 # 한글 폰트 설정 (윈도우용 예시)
 font_path = "C:/Windows/Fonts/malgun.ttf"  # '맑은 고딕' 경로 (사용 환경에 맞게 변경 필요)
@@ -43,7 +45,7 @@ except FileNotFoundError:
 # 마이너스 깨짐 방지
 matplotlib.rcParams['axes.unicode_minus'] = False
 
-PIXEL_TO_MM = 0.1  # 기본 픽셀 당 mm 변환 비율 (초기값)
+PIXEL_TO_MM = 0.01  # 기본 픽셀 당 mm 변환 비율 (초기값)
 
 def put_korean_text_on_cv2_image(img, text, pos, font, font_color):
     # OpenCV 이미지를 PIL 이미지로 변환
@@ -55,20 +57,71 @@ def put_korean_text_on_cv2_image(img, text, pos, font, font_color):
     img_cv2 = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
     return img_cv2
 
+
+class CustomToolbar(NavigationToolbar):
+    def __init__(self, canvas, parent_widget): # parent_widget 변수 이름 변경
+        super().__init__(canvas, parent_widget)
+        self.parent_widget = parent_widget # MultiPlotWidget 인스턴스를 직접 저장
+        self.zoom_active = False
+
+    def zoom(self, *args, **kwargs):
+        super().zoom(*args, **kwargs)
+        self.zoom_active = self.mode == 'zoom rect'
+        # 축 잠금 해제 시, 직접 저장한 인스턴스를 사용
+        if self.zoom_active:
+            self.parent_widget.lock_ax3 = False
+
+    def _zoom_rect_draw(self, event):
+        super()._zoom_rect_draw(event)
+        
+        if self.zoom_active and self._zoom_pan_info:
+            ax = self.canvas.figure.get_axes()[0] 
+            x_start, y_start, x_end, y_end = self._zoom_pan_info.rect_info
+            
+            dx = abs(x_end - x_start)
+            dy = abs(y_end - y_start)
+            
+            # 여기서 self.parent를 self.parent_widget로 변경
+            if ax is self.parent_widget.ax3: 
+                max_diff = max(dx, dy)
+                cx = (x_start + x_end) / 2
+                cy = (y_start + y_end) / 2
+                
+                self.parent_widget.ax3.set_xlim(cx - max_diff/2, cx + max_diff/2)
+                self.parent_widget.ax3.set_ylim(cy - max_diff/2, cy + max_diff/2)
+                
+                # 축 잠금
+                self.parent_widget.lock_ax3 = True
+            
+            self.canvas.draw_idle()
+
 class MultiPlotWidget(QWidget):
-    def __init__(self, max_points=100):
+    def __init__(self, max_points=50):
         super().__init__()
-        self.max_points = max_points
+        self.max_points = int(max_points)
 
-        self.fig = Figure(figsize=(20, 18))
+        self.default_metrics_text = (
+            "최대 중심 이탈 (mm): -\n"
+            "시작-마지막 점 차이 (mm): -\n"
+            "합/불 여부: -"
+        )
+
+        # 교체
+        self.fig = Figure(figsize=(20, 20), constrained_layout=True)  # CL 끔
         self.canvas = FigureCanvas(self.fig)
+        # 바깥 그리드: 3행 1열 (윗줄 두 그래프는 여기 한 칸만 사용)
+        outer = gridspec.GridSpec(3, 1, height_ratios=[2, 2, 6], hspace=0.6)
 
-        gs = gridspec.GridSpec(3, 1, height_ratios=[2, 2, 6], hspace=0.6)
+        self.ax1 = self.fig.add_subplot(outer[0, 0])   # X 이동량
+        self.ax2 = self.fig.add_subplot(outer[1, 0])   # Y 이동량
 
-        self.ax1 = self.fig.add_subplot(gs[0, 0])  # X 이동량
-        self.ax2 = self.fig.add_subplot(gs[1, 0])  # Y 이동량
-        self.ax3 = self.fig.add_subplot(gs[2, 0])  # XY 궤적
+        # 아래 행만 1x2 서브그리드로 쪼개서 왼쪽=궤적, 오른쪽=범례 전용
+        bottom = outer[2, 0].subgridspec(1, 2, width_ratios=[1.0, 0.34], wspace=0.25)
+        self.ax3 = self.fig.add_subplot(bottom[0, 0])  # XY 궤적
+        self.legend_ax3 = self.fig.add_subplot(bottom[0, 1])
+        self.legend_ax3.axis('off')                    # 범례 전용 축이므로 축표시는 끔
 
+        # 타이틀/그리드
         self.ax1.set_title("X 방향 프레임 간 이동량")
         self.ax1.set_ylabel("이동량 (mm)")
         self.ax1.grid(True)
@@ -83,70 +136,177 @@ class MultiPlotWidget(QWidget):
         self.ax3.set_xlabel("X 이동 거리 (mm)")
         self.ax3.set_ylabel("Y 이동 거리 (mm)")
         self.ax3.grid(True)
-        self.ax3.axis('equal')
-
-        # 초기 축 범위
-        self.ax1.set_ylim(-0.1, 0.1)
-        self.ax2.set_ylim(-0.1, 0.1)
-        self.ax3.set_xlim(-10, 10)
-        self.ax3.set_ylim(-10, 10)
         self.ax3.set_aspect('equal', adjustable='box')
 
-        self.x_disp_data = []
-        self.y_disp_data = []
-        self.frame_idx = []
+        # 초기 범위
+        self.ax1.set_ylim(-0.05, 0.05)
+        self.ax2.set_ylim(-0.05, 0.05)
+        self.ax3.set_xlim(-3, 3)
+        self.ax3.set_ylim(-3, 3)
 
-        self.line1, = self.ax1.plot([], [], 'r-', label='X 이동량 (mm)')
-        self.line2, = self.ax2.plot([], [], 'b-', label='Y 이동량 (mm)')
-        self.traj_line, = self.ax3.plot([], [], 'g-', label='이동 궤적')
+        # --- Data (고정 길이 윈도우) ---
+        from collections import deque
+        self.frame_idx          = deque(maxlen=self.max_points)
+        self.x_disp_data        = deque(maxlen=self.max_points)
+        self.y_disp_data        = deque(maxlen=self.max_points)
+        self.x_disp_data_blue   = deque(maxlen=self.max_points)
+        self.y_disp_data_blue   = deque(maxlen=self.max_points)
 
-        # 시작/끝 마커
-        self.start_marker, = self.ax3.plot([], [], 'bo', markersize=7, label='시작점', zorder=5)
-        self.end_marker, = self.ax3.plot([], [], 'rs', markersize=7, label='끝점', zorder=5)
+        # --- Lines ---
+        self.line1,       = self.ax1.plot([], [], 'r-',  label='X 이동량 (mm)')            # Yellow X
+        self.line2,       = self.ax2.plot([], [], 'b-',  label='Y 이동량 (mm)')            # Yellow Y
+        self.line1_blue,  = self.ax1.plot([], [], 'r--', label='X 이동량 (mm, 파랑)')      # Blue X
+        self.line2_blue,  = self.ax2.plot([], [], 'b--', label='Y 이동량 (mm, 파랑)')      # Blue Y
+        self.traj_line,        = self.ax3.plot([], [], 'y-', lw=1.6, label='이동 궤적(로드)')           # Yellow Traj
+        self.traj_line_blue,   = self.ax3.plot([], [], 'm-', lw=1.6,  label='이동 궤적(AlN)')     # Blue Traj
+        self.traj_line.set_visible(False)
+        self.traj_line_blue.set_visible(False)
+        self.traj_corr_line,   = self.ax3.plot([], [], 'g-', lw=2.0,  label='보정 궤적 (Y-B)')
 
-        self.ax1.legend()
-        self.ax2.legend()
-        self.ax3.legend()
+        # 토글 상태
+        self.show_yellow_traj = False
+        self.show_blue_traj   = False
 
+        # 시작/끝 마커(보정 궤적 기준)
+        self.start_marker, = self.ax3.plot([], [], 'bo', markersize=7, label='시작점(보정)', zorder=5)
+        self.end_marker,   = self.ax3.plot([], [], 'rs', markersize=7, label='끝점(보정)',   zorder=5)
+
+        self.ax1.legend(loc='upper right')
+        self.ax2.legend(loc='upper right')
+        self._legend_ax3_outside() 
+        
+        # Toolbar
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.canvas.updateGeometry()
-        self.toolbar = NavigationToolbar(self.canvas, self)
-
+        self.toolbar = CustomToolbar(self.canvas, self) 
         layout = QVBoxLayout()
-        layout.addWidget(self.toolbar)
-        layout.addWidget(self.canvas)
+        layout.addWidget(self.toolbar); layout.addWidget(self.canvas)
         self.setLayout(layout)
 
-        self.max_distance_from_center = 0.0
-        self.pass_fail_result = "-"   # "합격" / "불합격" / "-"
-
-
+        # 상태
         self.circle_patch = None
-
-        # --- 사용자 확대/이동 보존 플래그 ---
         self.lock_ax1 = False
         self.lock_ax2 = False
         self.lock_ax3 = False
-
-        # 사용자가 축을 바꾸면 자동으로 락 걸기
-        # self.ax1.callbacks.connect('xlim_changed', lambda ax: self._lock_ax('ax1'))
-        # self.ax1.callbacks.connect('ylim_changed', lambda ax: self._lock_ax('ax1'))
-        # self.ax2.callbacks.connect('xlim_changed', lambda ax: self._lock_ax('ax2'))
-        # self.ax2.callbacks.connect('ylim_changed', lambda ax: self._lock_ax('ax2'))
         self.ax3.callbacks.connect('xlim_changed', lambda ax: self._lock_ax('ax3'))
         self.ax3.callbacks.connect('ylim_changed', lambda ax: self._lock_ax('ax3'))
 
-        self.fig.tight_layout(pad=3.0)
-
+        # self.fig.tight_layout(pad=3.0)
         self._loc_cache = dict(ax1x=None, ax1y=None, ax2x=None, ax2y=None, ax3x=None, ax3y=None)
+       
+        # metrics_box 만들 때
+        self.metrics_box = self.fig.text(
+            0.81, 0.18, self.default_metrics_text,
+            ha="right", va="top", fontsize=10, fontweight="bold", linespacing=1.35,
+            bbox=dict(boxstyle="round,pad=1.0",
+                    facecolor="white", edgecolor="black",
+                    linewidth=2.0, alpha=0.98)
+        )
+        self.metrics_box.set_in_layout(False)
+
+    def _dedup_legend(self, handles, labels):
+        """같은 라벨은 하나만 남기기."""
+        seen = set()
+        h_out, l_out = [], []
+        for h, l in zip(handles, labels):
+            if not l or l == "_nolegend_" or l in seen:
+                continue
+            seen.add(l)
+            h_out.append(h); l_out.append(l)
+        return h_out, l_out
+
+    def _legend_ax3_outside(self, handles=None, labels=None):
+        """ax3의 범례를 오른쪽 전용 축(self.legend_ax3)에 그린다."""
+        # 1) 현재 ax3에서 핸들/라벨 가져오거나, 인자로 받은 것 사용
+        if handles is None or labels is None:
+            handles, labels = self.ax3.get_legend_handles_labels()
+
+        # 2) 중복 제거
+        handles, labels = self._dedup_legend(handles, labels)
+
+        # 3) 오른쪽 범례 전용 축 지우고 다시 그림
+        self.legend_ax3.cla()
+        self.legend_ax3.axis('off')
+
+        if handles:
+            self._ax3_legend = self.ax3.legend(handles, labels, loc='upper left', bbox_to_anchor=(1.02, 1))
+
+        else:
+            self._ax3_legend = None
+
+        # 4) 레이아웃은 이미 subgridspec으로 확보되어 있으니 조정 불필요
+        self.canvas.draw_idle()
+
+    def set_show_yellow_traj(self, flag: bool):
+        self.show_yellow_traj = bool(flag)
+        self.traj_line.set_visible(self.show_yellow_traj)
+        self.canvas.draw_idle()
+
+    def set_show_blue_traj(self, flag: bool):
+        self.show_blue_traj = bool(flag)
+        self.traj_line_blue.set_visible(self.show_blue_traj)
+        self.canvas.draw_idle()
+
+
+    def show_default_metrics(self):
+        self.set_metrics_text(self.default_metrics_text)
+
+    def set_metrics_text(self, text: str):
+        self.metrics_box.set_text(text or "")
+        self.canvas.draw_idle()
+
+
+    def reset(self):
+        self.frame_idx.clear()
+        self.x_disp_data.clear()
+        self.y_disp_data.clear()
+        self.x_disp_data_blue.clear()
+        self.y_disp_data_blue.clear()
+
+        # 존재하는 라인만 초기화
+        self.line1.set_data([], [])
+        self.line2.set_data([], [])
+        self.line1_blue.set_data([], [])
+        self.line2_blue.set_data([], [])
+        if hasattr(self, "traj_corr_line"):
+            self.traj_corr_line.set_data([], [])
+        if hasattr(self, "start_marker"):
+            self.start_marker.set_data([], [])
+        if hasattr(self, "end_marker"):
+            self.end_marker.set_data([], [])
+        self.traj_line.set_data([], [])
+        self.traj_line_blue.set_data([], [])
+
+        # 원형 패치 제거
+        if self.circle_patch is not None:
+            try:
+                self.circle_patch.remove()
+            except Exception:
+                pass
+            self.circle_patch = None
+
+        # 축 초기화
+        self.ax1.set_xlim(0, 1)
+        self.ax2.set_xlim(0, 1)
+        self.ax1.set_ylim(-0.05, 0.05)
+        self.ax2.set_ylim(-0.05, 0.05)
+        self.ax3.set_xlim(-3, 3)
+        self.ax3.set_ylim(-3, 3)
+        self.ax3.set_aspect('equal', adjustable='box')
+
+        # 작은 결과 라벨(있으면) 비우기
+        if hasattr(self, "metrics_box"):
+            self.metrics_box.set_text(self.default_metrics_text)
+
+        self.canvas.draw_idle()
 
 
     def _lock_ax(self, which):
-        if which == 'ax1': self.lock_ax1 = True
+        if   which == 'ax1': self.lock_ax1 = True
         elif which == 'ax2': self.lock_ax2 = True
         elif which == 'ax3': self.lock_ax3 = True
 
-    def update_plot(self, frame_number, dx_px, dy_px, pixel_to_mm=PIXEL_TO_MM,
+    def update_plot(self, frame_number, dx_px, dy_px, pixel_to_mm=0.03,
                     traj_x_offset=0.0, traj_y_offset=0.0,
                     ax1_ylim_min=None, ax1_ylim_max=None,
                     ax2_ylim_min=None, ax2_ylim_max=None,
@@ -156,129 +316,183 @@ class MultiPlotWidget(QWidget):
                     ax2_xtick_interval=None, ax2_ytick_interval=None,
                     ax3_xtick_interval=None, ax3_ytick_interval=None,
                     global_cumulative_x=None, global_cumulative_y=None,
-                    circle_center_x=None, circle_center_y=None, circle_radius=None):
+                    circle_center_x=None, circle_center_y=None, circle_radius=None,
+                    # 파랑(옵션)
+                    dx_px_blue=None, dy_px_blue=None,
+                    global_cumulative_x_blue=None, global_cumulative_y_blue=None,
+                    global_corrected_x=None, global_corrected_y=None,
+                    traj_blue_offset_x=0.0, traj_blue_offset_y=0.0, 
+                    show_yellow_traj=True, show_blue_traj=True,
+                    refresh_only=False):
 
-        dx = dx_px * pixel_to_mm
-        dy = dy_px * pixel_to_mm
+        # --- 1) 데이터 적재 (항상 같은 길이 유지) ---
+        self.frame_idx.append(int(frame_number))
+        self.x_disp_data.append(float(dx_px) * float(pixel_to_mm))
+        self.y_disp_data.append(float(dy_px) * float(pixel_to_mm))
 
-        # 데이터 적재
-        self.frame_idx.append(frame_number)
-        self.x_disp_data.append(dx)
-        self.y_disp_data.append(dy)
-        if len(self.frame_idx) > self.max_points:
-            self.frame_idx.pop(0); self.x_disp_data.pop(0); self.y_disp_data.pop(0)
+        if dx_px_blue is None or dy_px_blue is None:
+            self.x_disp_data_blue.append(np.nan)
+            self.y_disp_data_blue.append(np.nan)
+        else:
+            self.x_disp_data_blue.append(float(dx_px_blue) * float(pixel_to_mm))
+            self.y_disp_data_blue.append(float(dy_px_blue) * float(pixel_to_mm))
 
-        # 라인 갱신
-        self.line1.set_data(self.frame_idx, self.x_disp_data)
-        self.line2.set_data(self.frame_idx, self.y_disp_data)
+        # --- 2) numpy 배열로 변환 & 공통 길이 보장 ---
+        xi  = np.asarray(self.frame_idx, dtype=float)
+        xmm = np.asarray(self.x_disp_data, dtype=float)
+        ymm = np.asarray(self.y_disp_data, dtype=float)
+        xb  = np.asarray(self.x_disp_data_blue, dtype=float)
+        yb  = np.asarray(self.y_disp_data_blue, dtype=float)
 
-        # 라벨/축 제목
+        n = min(len(xi), len(xmm), len(ymm), len(xb), len(yb))
+        if n == 0:
+            self.canvas.draw_idle()
+            return global_cumulative_x, global_cumulative_y
+
+        xi, xmm, ymm, xb, yb = xi[-n:], xmm[-n:], ymm[-n:], xb[-n:], yb[-n:]
+
+        # --- 3) 라인 갱신 ---
+        self.line1.set_data(xi, xmm)   # 노랑 X
+        self.line2.set_data(xi, ymm)   # 노랑 Y
+        self.line1_blue.set_data(xi, xb)  # 파랑 X
+        self.line2_blue.set_data(xi, yb)  # 파랑 Y
+
+        # --- 4) X축: 좌측 0에서 시작 + max_points 지나면 자동 스크롤 ---
+        last_frame = int(xi[-1])
+        if not self.lock_ax1:
+            xmin = 0 if last_frame < self.max_points else last_frame - (self.max_points - 1)
+            xmax = max(xmin + 1, last_frame)
+            self.ax1.set_xlim(xmin, xmax)
+        if not self.lock_ax2:
+            xmin = 0 if last_frame < self.max_points else last_frame - (self.max_points - 1)
+            xmax = max(xmin + 1, last_frame)
+            self.ax2.set_xlim(xmin, xmax)
+
+        # --- 5) 라벨/눈금 ---
         self.ax1.set_xlabel("프레임 번호")
         self.ax2.set_xlabel("프레임 번호")
         self.ax1.set_ylabel("X 프레임 간 이동량 (mm)")
         self.ax2.set_ylabel("Y 프레임 간 이동량 (mm)")
 
-        # 궤적 갱신
-        if global_cumulative_x is not None and global_cumulative_y is not None:
-            x_plot = np.array(global_cumulative_x) - traj_x_offset
-            y_plot = np.array(global_cumulative_y) - traj_y_offset
-            self.traj_line.set_data(x_plot, y_plot)
-        else:
-            self.traj_line.set_data([], [])
+        self.ax1.xaxis.set_major_locator(ticker.MultipleLocator(ax1_xtick_interval) if ax1_xtick_interval else ticker.AutoLocator())
+        self.ax1.yaxis.set_major_locator(ticker.MultipleLocator(ax1_ytick_interval) if ax1_ytick_interval else ticker.AutoLocator())
+        self.ax2.xaxis.set_major_locator(ticker.MultipleLocator(ax2_xtick_interval) if ax2_xtick_interval else ticker.AutoLocator())
+        self.ax2.yaxis.set_major_locator(ticker.MultipleLocator(ax2_ytick_interval) if ax2_ytick_interval else ticker.AutoLocator())
+        self.ax3.xaxis.set_major_locator(ticker.MultipleLocator(ax3_xtick_interval) if ax3_xtick_interval else ticker.AutoLocator())
+        self.ax3.yaxis.set_major_locator(ticker.MultipleLocator(ax3_ytick_interval) if ax3_ytick_interval else ticker.AutoLocator())
 
-        # 시작/끝 마커
-        if global_cumulative_x is not None and len(global_cumulative_x) >= 1:
-            sx = global_cumulative_x[0] - traj_x_offset
-            sy = global_cumulative_y[0] - traj_y_offset
-            self.start_marker.set_data([sx], [sy])
-        else:
-            self.start_marker.set_data([], [])
-
-        if global_cumulative_x is not None and len(global_cumulative_x) >= 2:
-            ex = global_cumulative_x[-1] - traj_x_offset
-            ey = global_cumulative_y[-1] - traj_y_offset
-            self.end_marker.set_data([ex], [ey])
-        else:
-            self.end_marker.set_data([], [])
-
-        # 판정 원
-        if circle_center_x is not None and circle_center_y is not None and circle_radius and circle_radius > 0:
-            if self.circle_patch is None:
-                self.circle_patch = patches.Circle((circle_center_x, circle_center_y), circle_radius,
-                                                edgecolor='red', facecolor='none', linestyle='--', linewidth=2,
-                                                label='판정 기준 원')
-                self.ax3.add_patch(self.circle_patch)
-                leg = self.ax3.legend_
-                if leg is None:
-                    self.ax3.legend()
-                else:
-                    if '판정 기준 원' not in [t.get_text() for t in leg.texts]:
-                        self.ax3.legend()
-
-            else:
-                self.circle_patch.center = (circle_center_x, circle_center_y)
-                self.circle_patch.set_radius(circle_radius)
-        else:
-            if self.circle_patch is not None:
-                self.circle_patch.remove()
-                self.circle_patch = None
-
-        # 눈금 간격
-        self.ax1.tick_params(axis='x', labelsize=plt.rcParams['font.size'])
-        self.ax1.tick_params(axis='y', labelsize=plt.rcParams['font.size'])
-        self.ax2.tick_params(axis='x', labelsize=plt.rcParams['font.size'])
-        self.ax2.tick_params(axis='y', labelsize=plt.rcParams['font.size'])
-        self.ax3.tick_params(axis='x', labelsize=plt.rcParams['font.size'])
-        self.ax3.tick_params(axis='y', labelsize=plt.rcParams['font.size'])
-
-        self.ax1.xaxis.set_major_locator(ticker.MultipleLocator(ax1_xtick_interval) if ax1_xtick_interval is not None else ticker.AutoLocator())
-        self.ax1.yaxis.set_major_locator(ticker.MultipleLocator(ax1_ytick_interval) if ax1_ytick_interval is not None else ticker.AutoLocator())
-        self.ax2.xaxis.set_major_locator(ticker.MultipleLocator(ax2_xtick_interval) if ax2_xtick_interval is not None else ticker.AutoLocator())
-        self.ax2.yaxis.set_major_locator(ticker.MultipleLocator(ax2_ytick_interval) if ax2_ytick_interval is not None else ticker.AutoLocator())
-        self.ax3.xaxis.set_major_locator(ticker.MultipleLocator(ax3_xtick_interval) if ax3_xtick_interval is not None else ticker.AutoLocator())
-        self.ax3.yaxis.set_major_locator(ticker.MultipleLocator(ax3_ytick_interval) if ax3_ytick_interval is not None else ticker.AutoLocator())
-
-        # ---- X축 자동 스크롤 (항상 적용) ----
-        if self.frame_idx:
-            x_end = self.frame_idx[-1]
-            window = self.max_points
-            x_start = max(0, x_end - (window - 1))
-        else:
-            x_start, x_end = 0, self.max_points - 1
-
-        self.ax1.set_xlim(x_start, x_end)
-        self.ax2.set_xlim(x_start, x_end)
-       
-        if ax1_ylim_min is not None and ax1_ylim_max is not None:
-            self.ax1.set_ylim(ax1_ylim_min, ax1_ylim_max)
-
-        if ax2_ylim_min is not None and ax2_ylim_max is not None:
-            self.ax2.set_ylim(ax2_ylim_min, ax2_ylim_max)
-
-        # ax1, ax2 Y축 수동 범위 (락 아닐 때만)
+        # Y축 수동 범위 (락 아닐 때만)
         if not self.lock_ax1 and ax1_ylim_min is not None and ax1_ylim_max is not None:
             self.ax1.set_ylim(ax1_ylim_min, ax1_ylim_max)
         if not self.lock_ax2 and ax2_ylim_min is not None and ax2_ylim_max is not None:
             self.ax2.set_ylim(ax2_ylim_min, ax2_ylim_max)
 
-        # ax3 XY 범위 적용 (락 아닐 때만)
+        # --- 6) 궤적: 보정 궤적(Y-B)만 표시 ---
+        if global_corrected_x is not None and global_corrected_y is not None:
+            xc = np.asarray(global_corrected_x, dtype=float)
+            yc = np.asarray(global_corrected_y, dtype=float)
+            self.traj_corr_line.set_data(xc, yc)
+
+            # 시작/끝 마커(보정)
+            if len(xc) >= 1:
+                self.start_marker.set_data([xc[0]], [yc[0]])
+            else:
+                self.start_marker.set_data([], [])
+            if len(xc) >= 2:
+                self.end_marker.set_data([xc[-1]], [yc[-1]])
+            else:
+                self.end_marker.set_data([], [])
+        else:
+            self.traj_corr_line.set_data([], [])
+            self.start_marker.set_data([], [])
+            self.end_marker.set_data([], [])
+
+        # ax3 범위(락 아닐 때만) — 기존 유지
         if not self.lock_ax3:
             if ax3_xlim_min is not None and ax3_xlim_max is not None:
                 self.ax3.set_xlim(ax3_xlim_min, ax3_xlim_max)
             if ax3_ylim_min is not None and ax3_ylim_max is not None:
                 self.ax3.set_ylim(ax3_ylim_min, ax3_ylim_max)
-
-        # 비율 유지
         self.ax3.set_aspect('equal', adjustable='box')
+
+        # --- 원본 궤적(노랑) 표시 ---
+        if (global_cumulative_x is not None and global_cumulative_y is not None and self.show_yellow_traj):
+            x_plot = np.asarray(global_cumulative_x, dtype=float) - float(traj_x_offset)
+            y_plot = np.asarray(global_cumulative_y, dtype=float) - float(traj_y_offset)
+            self.traj_line.set_data(x_plot, y_plot)
+        else:
+            self.traj_line.set_data([], [])
+
+        # --- 원본 궤적(파랑) 표시 ---
+        if (global_cumulative_x_blue is not None and global_cumulative_y_blue is not None and self.show_blue_traj):
+            xb_plot = np.asarray(global_cumulative_x_blue, dtype=float) - float(traj_blue_offset_x)
+            yb_plot = np.asarray(global_cumulative_y_blue, dtype=float) - float(traj_blue_offset_y)
+            self.traj_line_blue.set_data(xb_plot, yb_plot)
+        else:
+            self.traj_line_blue.set_data([], [])
+
+        # --- 7) 판정 원 & 범례 재구성 ---
+        show_circle = (
+            circle_center_x is not None and
+            circle_center_y is not None and
+            circle_radius   is not None and circle_radius > 0
+        )
+
+        # 판정 원(패치) 그리기/업데이트/제거
+        if show_circle:
+            if self.circle_patch is None:
+                self.circle_patch = patches.Circle(
+                    (circle_center_x, circle_center_y), circle_radius,
+                    edgecolor='red', facecolor='none',
+                    linestyle='--', linewidth=2, label='판정 기준 원'
+                )
+                self.ax3.add_patch(self.circle_patch)
+            else:
+                self.circle_patch.center = (circle_center_x, circle_center_y)
+                self.circle_patch.set_radius(circle_radius)
+        else:
+            if self.circle_patch is not None:
+                try:
+                    self.circle_patch.remove()
+                except Exception:
+                    pass
+                self.circle_patch = None
+
+        # ---- 범례 재구성 ----
+        handles, labels = [], []
+
+        # 보정 궤적(항상)
+        handles.append(self.traj_corr_line); labels.append(self.traj_corr_line.get_label())
+
+        # 원본 궤적(토글로 보일 때만)
+        if self.traj_line.get_visible():
+            handles.append(self.traj_line); labels.append(self.traj_line.get_label())
+        if self.traj_line_blue.get_visible():
+            handles.append(self.traj_line_blue); labels.append(self.traj_line_blue.get_label())
+
+        # 시작/끝 마커
+        handles += [self.start_marker, self.end_marker]
+        labels  += [self.start_marker.get_label(), self.end_marker.get_label()]
+
+        # 판정 원
+        if show_circle:
+            circle_proxy = Line2D([0],[0], color='red', linestyle='--', linewidth=2, label='판정 기준 원')
+            handles.append(circle_proxy); labels.append('판정 기준 원')
+
+        # 중복 제거 후, 축 밖으로 배치
+        handles_dedup, labels_dedup = self._dedup_legend(handles, labels)
+        self._legend_ax3_outside(handles_dedup, labels_dedup)
+
+        # --- 8) 그리기 ---
         self.canvas.draw_idle()
 
+        # 내부 로케이터 캐시(선택)
         def _set_locator(ax, axis, newv, key):
             prev = self._loc_cache[key]
             if prev != newv:
                 loc = ticker.MultipleLocator(newv) if newv is not None else ticker.AutoLocator()
-                (ax.xaxis if axis=='x' else ax.yaxis).set_major_locator(loc)
+                (ax.xaxis if axis == 'x' else ax.yaxis).set_major_locator(loc)
                 self._loc_cache[key] = newv
-
         _set_locator(self.ax1, 'x', ax1_xtick_interval, 'ax1x')
         _set_locator(self.ax1, 'y', ax1_ytick_interval, 'ax1y')
         _set_locator(self.ax2, 'x', ax2_xtick_interval, 'ax2x')
@@ -288,6 +502,7 @@ class MultiPlotWidget(QWidget):
 
         return global_cumulative_x, global_cumulative_y
 
+
 class ColorTrackerApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -295,8 +510,10 @@ class ColorTrackerApp(QWidget):
         self.resize(1800, 1200)
         self.frame_idx = []
         main_layout = QHBoxLayout()
-
         left_layout = QVBoxLayout()
+
+        self.is_camera_mode = False
+        self.camera_index = 0  # 기본 0번 카메라
 
         # 영상 컨테이너
         self.video_container_widget = QWidget()
@@ -387,6 +604,12 @@ class ColorTrackerApp(QWidget):
 
         top_buttons_layout.addStretch(1)
         left_layout.addLayout(top_buttons_layout)
+
+        # 상단 버튼 묶음 만들 때(영상 열기/스케일 보정 등 바로 옆)에 추가
+        self.open_camera_button = QPushButton("카메라 ON")
+        self.open_camera_button.setFixedSize(120, 30)
+        self.open_camera_button.clicked.connect(self.open_camera)
+        top_buttons_layout.addWidget(self.open_camera_button)
 
         # FPS/프레임 이동
         fps_frame_layout = QHBoxLayout()
@@ -535,8 +758,23 @@ class ColorTrackerApp(QWidget):
 
         # 우측: 플롯 + 판정
         right_layout = QVBoxLayout()
-        self.plot_widget = MultiPlotWidget(max_points=300)
+        self.plot_widget = MultiPlotWidget(max_points=50)
         right_layout.addWidget(self.plot_widget)
+
+        # 궤적 표시 토글
+        self.traj_toggle_group = QGroupBox("궤적 표시")
+        tog_layout = QHBoxLayout()
+        self.chk_show_yellow = QCheckBox("노랑(Y) 궤적")
+        self.chk_show_blue   = QCheckBox("파랑(B) 궤적")
+        tog_layout.addWidget(self.chk_show_yellow)
+        tog_layout.addWidget(self.chk_show_blue)
+        tog_layout.addStretch()
+        self.traj_toggle_group.setLayout(tog_layout)
+        right_layout.addWidget(self.traj_toggle_group)
+
+        # 시그널 연결
+        self.chk_show_yellow.toggled.connect(self.toggle_yellow_traj)
+        self.chk_show_blue.toggled.connect(self.toggle_blue_traj)
 
         self.judgment_group = QGroupBox("합/불 판정 기준")
         judgment_layout = QGridLayout()
@@ -587,6 +825,15 @@ class ColorTrackerApp(QWidget):
         self.lower_yellow = np.array([26, 50, 100])
         self.upper_yellow = np.array([60, 255, 255])
 
+        # HSV 파랑 범위
+        self.lower_blue = np.array([90, 100, 50])
+        self.upper_blue = np.array([130, 255, 255])
+
+        # 파랑 트래킹 상태
+        self.prev_center_blue = None
+        self.global_cumulative_x_blue = []
+        self.global_cumulative_y_blue = []
+
         self.global_cumulative_x = []
         self.global_cumulative_y = []
         self.traj_x_offset = 0.0
@@ -611,10 +858,10 @@ class ColorTrackerApp(QWidget):
         self.ax2_xtick_interval = None
         self.ax2_ytick_interval = None
 
-        self.ax3_xlim_min = -10.0
-        self.ax3_xlim_max = 10.0
-        self.ax3_ylim_min = -10.0
-        self.ax3_ylim_max = 10.0
+        self.ax3_xlim_min = -3.0
+        self.ax3_xlim_max = 3.0
+        self.ax3_ylim_min = -3.0
+        self.ax3_ylim_max = 3.0
         self.ax3_xtick_interval = None
         self.ax3_ytick_interval = None
 
@@ -642,7 +889,6 @@ class ColorTrackerApp(QWidget):
 
         self.judgment_warmup = 10  # 처음 10프레임은 판정 보류
 
-        self.current_fps = 30.0  # 이미 있으면 유지
         self.video_fps_label = QLabel("Video FPS: --", self.video_display_label)
         self.video_fps_label.setStyleSheet(
             "color:white; background:rgba(0,0,0,0.5); padding:2px 6px; font-size:12px;"
@@ -650,6 +896,309 @@ class ColorTrackerApp(QWidget):
         self.video_fps_label.raise_()   # 영상 위로 띄우기
 
         self.source_fps = None  # 원본 영상 FPS (없으면 None)
+
+        self.video_path = None
+
+        self.traj_blue_offset_x = 0.0
+        self.traj_blue_offset_y = 0.0
+
+        self.max_distance_from_center_corr = 0.0   # 보정 기준 최대 이탈
+        self.pass_fail_result_corr = "-"           # 보정 기준 합/불
+
+        self._need_fresh_start = False   # 다음에 재생 누르면 완전 초기화해서 0프레임부터 시작
+
+        # __init__ 끝부분쯤
+        self.DEBUG = False  # 필요할 때 True로 바꾸면 전역 디버그 온
+
+    # ColorTrackerApp 클래스에 다음 메서드를 추가하세요.
+
+    def stop_camera_and_reset_ui(self):
+        """
+        카메라 연결을 종료하고 UI를 초기 상태로 되돌립니다.
+        """
+        self.timer.stop()
+
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+        
+        self.video_playing = False
+        self.is_camera_mode = False
+        
+        # UI 업데이트
+        self.play_pause_button.setText("재생")
+        self.open_camera_button.setText("카메라 ON")
+        self.video_slider.setRange(0, 0)
+        self.video_slider.setEnabled(False)
+        self.current_time_label.setText("--:--")
+        self.total_time_label.setText("--:--")
+        self.video_display_label.setText("동영상을 선택하거나 카메라를 켜세요")
+        self.video_display_label.setStyleSheet("background-color: black;")
+        self.update_fps_label()
+        # 추적 데이터는 유지
+        self.plot_widget.canvas.draw_idle()
+
+
+        # # 추적 데이터 초기화
+        # self.prev_center = None
+        # self.prev_center_blue = None
+        # self.global_cumulative_x = []
+        # self.global_cumulative_y = []
+        # self.global_cumulative_x_blue = []
+        # self.global_cumulative_y_blue = []
+        # self.plot_widget.reset()
+        # self.plot_widget.show_default_metrics()
+
+        # 이 부분을 추가하여 마지막 상태로 그래프를 한 번 더 갱신합니다.
+        self.update_all_plots()
+
+    # ColorTrackerApp 클래스 안에 있는 open_camera 메서드입니다.
+    def open_camera(self, index=None, width=1280, height=720):
+        # 카메라가 이미 켜져 있다면 종료
+        if self.is_camera_mode and self.cap is not None:
+            # 이 부분에서도 타이머를 먼저 멈춰야 함
+            self.timer.stop() 
+            self.stop_camera_and_reset_ui()
+            QMessageBox.information(self, "카메라 OFF", "카메라 연결이 종료되었습니다.")
+            return
+
+        # 0) 타이머/기존 장치 정리
+        self.timer.stop()
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+        idx = self.camera_index if index is None else int(index)
+
+        # 1) 시도할 백엔드(환경에 따라 순서 바꿔도 됨)
+        backends = [
+            ("DSHOW", cv2.CAP_DSHOW),
+            ("MSMF",  cv2.CAP_MSMF),
+            ("ANY",   cv2.CAP_ANY),
+        ]
+        tried_logs = []
+        cap_ok = None
+        first_frame = None
+
+        for name, be in backends:
+            cap = None
+            try:
+                cap = cv2.VideoCapture(idx, be)
+                opened = cap.isOpened()
+                tried_logs.append(f"{name}: opened={opened}")
+                if not opened:
+                    if cap: cap.release()
+                    continue
+
+                # 2) 열리자마자 바로 read로 ‘진짜’ 확인
+                #    (일부 드라이버는 opened True라도 read가 False)
+                #    첫 프레임은 2~3번 재시도
+                ok, frame = False, None
+                for _ in range(3):
+                    ok, frame = cap.read()
+                    if ok and frame is not None:
+                        break
+                tried_logs.append(f"{name}: first_read={ok}")
+
+                if not ok or frame is None:
+                    cap.release()
+                    continue
+
+                # 3) 해상도는 첫 read 성공 후 적용 (중요)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+                # 옵션: 해상도 적용 후 한 번 더 read 확인
+                ok2, frame2 = cap.read()
+                tried_logs.append(f"{name}: post_set_read={ok2}")
+                if not ok2 or frame2 is None:
+                    # 그래도 쓸 수 있는 경우가 많아서 완전히 실패 처리하진 않고 진행
+                    pass
+
+                cap_ok = cap
+                first_frame = frame
+                self._d("카메라 오픈 성공:", name)
+                break
+
+            except Exception as e:
+                tried_logs.append(f"{name}: exception={e}")
+                if cap:
+                    try: cap.release()
+                    except: pass
+
+        if cap_ok is None:
+            # 실패 원인 로그 보여주기
+            msg = "카메라를 열 수 없습니다. 연결/권한/점유 상태를 확인하세요.\n" + "\n".join(tried_logs)
+            QMessageBox.critical(self, "카메라 오류", msg)
+            self.is_camera_mode = False
+            return
+
+        # 4) 성공 시 상태 초기화 & UI
+        self.cap = cap_ok
+        # 카메라 열기 성공 직후(타이머 시작 전에)
+        self.is_camera_mode = True
+        self.frame_count = -1         # 첫 next_frame()에서 +1 되어 0부터 시작
+        self.plot_widget.lock_ax1 = False
+        self.plot_widget.lock_ax2 = False
+        self.plot_widget.lock_ax3 = False
+        self.video_path = None
+
+        self.video_slider.setRange(0, 0)
+        self.video_slider.setEnabled(False)
+        self.current_time_label.setText("--:--")
+        self.total_time_label.setText("--:--")
+        self.open_camera_button.setText("카메라 OFF")
+
+        # 추적/그래프 초기화
+        self.prev_center = None
+        self.prev_center_blue = None
+        self.global_cumulative_x = [0.0]
+        self.global_cumulative_y = [0.0]
+        self.global_cumulative_x_blue = [0.0]
+        self.global_cumulative_y_blue = [0.0]
+        self.traj_x_offset = self.traj_y_offset = 0.0
+        self.traj_blue_offset_x = self.traj_blue_offset_y = 0.0
+        self.max_distance_from_center = 0.0
+        self.pass_fail_result = "-"
+        self.passed_judgment = True
+        self.plot_widget.reset()
+        self.plot_widget.show_default_metrics()
+
+        # FPS 설정(웹캠은 원본 FPS 신뢰 낮으니 30 기본)
+        self.source_fps = None
+        self._set_playback_fps(30.0, show_warning=False)
+
+        # 칼만
+        self.kf      = KalmanCV2D(dt=1.0/self.current_fps, process_var=1e-2, measurement_var=5.0)
+        self.kf_blue = KalmanCV2D(dt=1.0/self.current_fps, process_var=1e-2, measurement_var=5.0)
+
+        # 첫 프레임 표시(열자마자 읽어둔 프레임 활용)
+        if first_frame is not None:
+            self.display_frame(first_frame)
+        else:
+            ok, fr = self.cap.read()
+            if ok: self.display_frame(fr)
+
+        self.timer.start(int(1000 / self.current_fps))
+        self.video_playing = True
+        self.play_pause_button.setText("일시정지")
+        self.update_fps_label()
+        self._need_fresh_start = False
+
+
+    def stop_camera(self):
+        # 라이브 입력은 정지/초기화시 그래프만 리셋하고 장치는 유지하거나, 필요시 해제
+        self.timer.stop()
+        self.video_playing = False
+        self.play_pause_button.setText("재생")
+        # 그래프/상태만 리셋
+        self.plot_widget.reset()
+        self.plot_widget.show_default_metrics()
+        self.global_cumulative_x = [0.0]
+        self.global_cumulative_y = [0.0]
+        self.global_cumulative_x_blue = [0.0]
+        self.global_cumulative_y_blue = [0.0]
+        self.traj_x_offset = self.traj_y_offset = 0.0
+        self.traj_blue_offset_x = self.traj_blue_offset_y = 0.0
+        self.prev_center = None
+        self.prev_center_blue = None
+        if hasattr(self, "kf") and self.kf: self.kf.reset()
+        if hasattr(self, "kf_blue") and self.kf_blue: self.kf_blue.reset()
+
+    def list_cameras(self, max_index=6):
+        ok = []
+        for i in range(max_index):
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                ok.append(i)
+            cap.release()
+        return ok
+
+
+    def toggle_yellow_traj(self, checked: bool):
+        self.plot_widget.set_show_yellow_traj(checked)
+        self.update_all_plots()
+
+    def toggle_blue_traj(self, checked: bool):
+        self.plot_widget.set_show_blue_traj(checked)
+        self.update_all_plots()
+
+
+    def _d(self, *args, **kwargs):
+        if self.DEBUG:
+            print(*args, **kwargs)
+
+
+    def _get_corrected_arrays(self):
+        """
+        노란 누적(X,Y) - 파란 누적(X,Y) = 보정 누적(X,Y)
+        두 색 모두 같은 프레임 범위로 잘라 반환. 데이터 없으면 (None, None)
+        """
+        if (not self.global_cumulative_x or not self.global_cumulative_y or
+            not self.global_cumulative_x_blue or not self.global_cumulative_y_blue):
+            return None, None
+
+        yx = np.asarray(self.global_cumulative_x, dtype=float)
+        yy = np.asarray(self.global_cumulative_y, dtype=float)
+        bx = np.asarray(self.global_cumulative_x_blue, dtype=float)
+        by = np.asarray(self.global_cumulative_y_blue, dtype=float)
+
+        n = min(len(yx), len(yy), len(bx), len(by))
+        if n == 0:
+            return None, None
+
+        x_corr = (yx[:n] - bx[:n]).tolist()
+        y_corr = (yy[:n] - by[:n]).tolist()
+        return x_corr, y_corr
+
+
+    def _update_corrected_metrics_and_overlay(self):
+        """
+        보정 궤적 기준으로 최대 중심 이탈, 시작-마지막 차이, 합/불(마지막 점) 계산
+        그리고 우측 작은 텍스트 오버레이 갱신.
+        """
+        x_corr, y_corr = self._get_corrected_arrays()
+        if not x_corr:
+            # 오버레이만 초기화
+            self.max_distance_from_center_corr = 0.0
+            self.pass_fail_result_corr = "-"
+            if hasattr(self, "plot_widget"):
+                self.plot_widget.set_metrics_text(
+                    "최대 중심 이탈 (mm): -\n"
+                    "시작-마지막 점 차이 (mm): -\n"
+                    "합/불 여부: -"
+                )
+            return
+
+        x = np.asarray(x_corr, dtype=float) - float(self.traj_x_offset)
+        y = np.asarray(y_corr, dtype=float) - float(self.traj_y_offset)
+
+        # 최대 중심 이탈
+        if self.circle_radius is not None and self.circle_radius > 0:
+            d_all = np.hypot(x - float(self.circle_center_x), y - float(self.circle_center_y))
+            self.max_distance_from_center_corr = float(np.max(d_all))
+            last_d = float(d_all[-1])
+            pass_last = last_d <= float(self.circle_radius)
+            pass_max  = self.max_distance_from_center_corr <= float(self.circle_radius)
+            self.pass_fail_result_corr = "합격" if (pass_last and pass_max) else "불합격"
+        else:
+            self.max_distance_from_center_corr = float(np.max(np.hypot(x, y)))
+            self.pass_fail_result_corr = "-"
+
+        # 시작-마지막 점 차이(보정)
+        start_end = float(np.hypot(x[-1] - x[0], y[-1] - y[0]))
+
+        # 우측 작은 라벨(figure 오버레이)
+        if hasattr(self, "plot_widget"):
+            self.plot_widget.set_metrics_text(
+                f"최대 중심 이탈 (mm): {self.max_distance_from_center_corr:.3f}\n"
+                f"시작-마지막 점 차이 (mm): {start_end:.3f}\n"
+                f"합/불 여부: {self.pass_fail_result_corr}"
+            )
+
 
     def _set_playback_fps(self, new_fps, show_warning=False):
         if hasattr(self, "source_fps") and self.source_fps:
@@ -673,7 +1222,7 @@ class ColorTrackerApp(QWidget):
             self.traj_x_offset = self.global_cumulative_x[-1]
             self.traj_y_offset = self.global_cumulative_y[-1]
             QMessageBox.information(self, "원점 재설정", "현재 위치를 새로운 원점으로 설정했습니다.")
-            print(f"로그: 원점 재설정. Offset = ({self.traj_x_offset:.2f}, {self.traj_y_offset:.2f})")
+            print(f"로그: 원점 재설정. Offset = ({self.traj_x_offset:.3f}, {self.traj_y_offset:.3f})")
             self.update_all_plots()
         else:
             QMessageBox.warning(self, "경고", "궤적 데이터가 없어 원점을 재설정할 수 없습니다.")
@@ -717,6 +1266,7 @@ class ColorTrackerApp(QWidget):
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "동영상 선택", "", "Video Files (*.mp4 *.avi *.mov)")
         if path:
+            self.video_path = path
             if self.cap is not None:
                 self.cap.release()
             self.cap = cv2.VideoCapture(path)
@@ -763,10 +1313,15 @@ class ColorTrackerApp(QWidget):
             self.kf = KalmanCV2D(dt=1.0/self.current_fps,
                      process_var=1e-2,
                      measurement_var=5.0)
+            
+            self.kf_blue = KalmanCV2D(dt=1.0/self.current_fps, process_var=1e-2, measurement_var=5.0)
+
             self.frame_count = 0
             self.plot_widget.x_disp_data.clear()
             self.plot_widget.y_disp_data.clear()
             self.plot_widget.frame_idx.clear()
+            self.plot_widget.x_disp_data_blue.clear()
+            self.plot_widget.y_disp_data_blue.clear()
             self.global_cumulative_x = [0.0]
             self.global_cumulative_y = [0.0]
             self.traj_x_offset = 0.0
@@ -794,31 +1349,54 @@ class ColorTrackerApp(QWidget):
 
             self.prev_center = None
             self.kf.reset()
+            self.plot_widget.reset()
+            self.plot_widget.show_default_metrics()
+
+            self.is_camera_mode = False
 
             # ✅ 새 영상 열면 스케일 보정값 초기화(기본값으로)
             self.PIXEL_TO_MM = 0.03
+
+            self.kf_blue = KalmanCV2D(dt=1.0/self.current_fps, process_var=1e-2, measurement_var=5.0)
+            self.prev_center_blue = None
+            self.global_cumulative_x_blue = [0.0]
+            self.global_cumulative_y_blue = [0.0]
 
     def next_frame(self):
         if self.cap is None:
             return
 
         ret, frame = self.cap.read()
-        if not ret:
-            print("로그: 더 이상 읽을 프레임이 없습니다. 동영상 종료.")
-            self.timer.stop()
-            self.video_playing = False
-            self.play_pause_button.setText("재생")
-            self.cap.release()
-            self.cap = None
-            if self.global_cumulative_x and self.global_cumulative_y:
-                reply = QMessageBox.question(self, '저장 확인',
-                                             "영상이 종료되었습니다. 측정된 데이터를 xlsx 파일로 저장하시겠습니까?",
-                                             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-                if reply == QMessageBox.Yes:
-                    self.save_to_xlsx()
-            return
 
-        self.frame_count = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+        if not ret:
+            if self.is_camera_mode:
+                # 라이브 입력: 저장 질문 없이 정지만
+                self.timer.stop()
+                self.video_playing = False
+                self.play_pause_button.setText("재생")
+                QMessageBox.warning(self, "카메라", "카메라 프레임을 읽지 못했습니다. 연결 상태를 확인하세요.")
+                return
+            else:
+                # 파일 모드: 기존 EOF 처리(저장 여부 묻기) 유지
+                self.timer.stop()
+                self.video_playing = False
+                self.play_pause_button.setText("재생")
+                if self.global_cumulative_x and self.global_cumulative_y:
+                    reply = QMessageBox.question(
+                        self, '저장 확인',
+                        "영상이 종료되었습니다. 측정된 데이터를 xlsx 파일로 저장하시겠습니까?",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+                    )
+                    if reply == QMessageBox.Yes:
+                        self.save_to_xlsx()
+                self._need_fresh_start = True
+                return
+
+
+        if self.is_camera_mode:
+            self.frame_count = 0 if self.frame_count is None or self.frame_count < 0 else self.frame_count + 1
+        else:
+            self.frame_count = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
 
         if self.calibrating:
             # 보정 중에는 고정 프레임 계속 표시
@@ -888,11 +1466,57 @@ class ColorTrackerApp(QWidget):
         # 텍스트 오버레이(선택)
         if filt_x is not None and self.prev_center is not None:
             frame = put_korean_text_on_cv2_image(
-                frame, f"X 이동량: {dx_px*self.PIXEL_TO_MM:.2f} mm", (10, 30),
+                frame, f"X 이동량: {dx_px*self.PIXEL_TO_MM:.3f} mm", (10, 30),
                 korean_font, (255, 0, 0))
             frame = put_korean_text_on_cv2_image(
-                frame, f"Y 이동량: {dy_px*self.PIXEL_TO_MM:.2f} mm", (10, 60),
+                frame, f"Y 이동량: {dy_px*self.PIXEL_TO_MM:.3f} mm", (10, 60),
                 korean_font, (0, 0, 255))
+
+        # --- Blue 마스크 ---
+        mask_b = cv2.inRange(hsv, self.lower_blue, self.upper_blue)
+        mask_b = cv2.medianBlur(mask_b, 5)
+        mask_b = cv2.erode(mask_b, kernel, iterations=1)
+        mask_b = cv2.dilate(mask_b, kernel, iterations=2)
+
+        try:
+            contours_b, _ = cv2.findContours(mask_b, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        except ValueError:
+            _, contours_b, _ = cv2.findContours(mask_b, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        center_b = None
+        if contours_b:
+            cb = max(contours_b, key=cv2.contourArea)
+            area_b = cv2.contourArea(cb)
+            if area_b > self.min_contour_area:
+                (xb, yb), radius_b = cv2.minEnclosingCircle(cb)
+                center_b = (float(xb), float(yb))
+                # 파랑은 화면에 빨간 원으로
+                cv2.circle(frame, (int(xb), int(yb)), int(radius_b), (255, 0, 0), 2)
+
+        # --- Kalman(Blue) ---
+        if self.prev_center_blue is None and center_b is not None:
+            self.kf_blue.initialize(center_b[0], center_b[1])
+
+        pred_b = self.kf_blue.predict()
+        if center_b is not None:
+            filt_x_b, filt_y_b = self.kf_blue.update(center_b[0], center_b[1])
+        else:
+            filt_x_b, filt_y_b = (pred_b if pred_b[0] is not None else (None, None))
+
+        dx_px_blue, dy_px_blue = 0.0, 0.0
+        if filt_x_b is not None and self.prev_center_blue is not None:
+            dx_px_blue = filt_x_b - self.prev_center_blue[0]
+            dy_px_blue = filt_y_b - self.prev_center_blue[1]
+
+        if filt_x_b is not None:
+            self.prev_center_blue = (filt_x_b, filt_y_b)
+
+        # 화면 텍스트(파랑)
+        if filt_x_b is not None and self.prev_center_blue is not None:
+            frame = put_korean_text_on_cv2_image(
+                frame, f"B X 이동량: {dx_px_blue*self.PIXEL_TO_MM:.3f} mm", (10, 90), korean_font, (255, 255, 0))
+            frame = put_korean_text_on_cv2_image(
+                frame, f"B Y 이동량: {dy_px_blue*self.PIXEL_TO_MM:.3f} mm", (10, 120), korean_font, (255, 255, 0))
 
 
         self.display_frame(frame)
@@ -903,22 +1527,50 @@ class ColorTrackerApp(QWidget):
         current_dy_mm = dy_px * self.PIXEL_TO_MM
 
         if self.frame_count == 0:
+            # 첫 프레임일 때는 리스트를 초기화
             self.global_cumulative_x = [0.0]
             self.global_cumulative_y = [0.0]
-
-        if len(self.global_cumulative_x) <= self.frame_count:
+        elif self.frame_count >= len(self.global_cumulative_x):
+            # 리스트의 끝에 새로운 프레임 데이터 추가
+            # 동영상을 순차적으로 재생하는 일반적인 경우
             prev_x = self.global_cumulative_x[-1] if self.global_cumulative_x else 0.0
             prev_y = self.global_cumulative_y[-1] if self.global_cumulative_y else 0.0
             self.global_cumulative_x.append(prev_x + current_dx_mm)
             self.global_cumulative_y.append(prev_y + current_dy_mm)
-        else:
-            prev_x = self.global_cumulative_x[self.frame_count - 1] if self.frame_count > 0 else 0.0
-            prev_y = self.global_cumulative_y[self.frame_count - 1] if self.frame_count > 0 else 0.0
-            self.global_cumulative_x[self.frame_count] = prev_x + current_dx_mm
-            self.global_cumulative_y[self.frame_count] = prev_y + current_dy_mm
-            self.global_cumulative_x = self.global_cumulative_x[:self.frame_count + 1]
-            self.global_cumulative_y = self.global_cumulative_y[:self.frame_count + 1]
+        elif self.frame_count < len(self.global_cumulative_x) and self.frame_count > 0:
+            # 슬라이더 등으로 과거 프레임으로 돌아간 경우
+            # 해당 프레임 이후의 데이터를 모두 버리고 다시 계산
+            self.global_cumulative_x = self.global_cumulative_x[:self.frame_count]
+            self.global_cumulative_y = self.global_cumulative_y[:self.frame_count]
+            prev_x = self.global_cumulative_x[self.frame_count-1]
+            prev_y = self.global_cumulative_y[self.frame_count-1]
+            self.global_cumulative_x.append(prev_x + current_dx_mm)
+            self.global_cumulative_y.append(prev_y + current_dy_mm)
 
+
+        # 위와 동일한 로직을 파란색 궤적에 대해서도 적용합니다.
+
+        current_dx_mm_b = dx_px_blue * self.PIXEL_TO_MM
+        current_dy_mm_b = dy_px_blue * self.PIXEL_TO_MM
+
+        if self.frame_count == 0:
+            self.global_cumulative_x_blue = [0.0]
+            self.global_cumulative_y_blue = [0.0]
+        elif self.frame_count >= len(self.global_cumulative_x_blue):
+            prev_xb = self.global_cumulative_x_blue[-1] if self.global_cumulative_x_blue else 0.0
+            prev_yb = self.global_cumulative_y_blue[-1] if self.global_cumulative_y_blue else 0.0
+            self.global_cumulative_x_blue.append(prev_xb + current_dx_mm_b)
+            self.global_cumulative_y_blue.append(prev_yb + current_dy_mm_b)
+        elif self.frame_count < len(self.global_cumulative_x_blue) and self.frame_count > 0:
+            self.global_cumulative_x_blue = self.global_cumulative_x_blue[:self.frame_count]
+            self.global_cumulative_y_blue = self.global_cumulative_y_blue[:self.frame_count]
+            prev_xb = self.global_cumulative_x_blue[self.frame_count-1]
+            prev_yb = self.global_cumulative_y_blue[self.frame_count-1]
+            self.global_cumulative_x_blue.append(prev_xb + current_dx_mm_b)
+            self.global_cumulative_y_blue.append(prev_yb + current_dy_mm_b)
+
+
+        # --- 판정 (보정값: (노랑-원점) - (파랑-원점)) ---
         if self.circle_center_x is not None and self.circle_center_y is not None and self.circle_radius is not None:
             if self.global_cumulative_x and self.passed_judgment:
                 if (
@@ -929,38 +1581,59 @@ class ColorTrackerApp(QWidget):
                     len(self.global_cumulative_x) > 1 and
                     self.passed_judgment
                 ):
-                    current_x_mm = self.global_cumulative_x[-1] - self.traj_x_offset
-                    current_y_mm = self.global_cumulative_y[-1] - self.traj_y_offset
-                    distance_from_center = math.hypot(current_x_mm - self.circle_center_x,
-                                                    current_y_mm - self.circle_center_y)
+                    # 보정 좌표(현재 프레임)
+                    cur_x_corr = (self.global_cumulative_x[-1] - self.traj_x_offset) - \
+                                (self.global_cumulative_x_blue[-1] - self.traj_blue_offset_x)
+                    cur_y_corr = (self.global_cumulative_y[-1] - self.traj_y_offset) - \
+                                (self.global_cumulative_y_blue[-1] - self.traj_blue_offset_y)
 
-                    # ★ 최대 이탈 거리 갱신
+                    # 원 중심 기준 이탈 거리
+                    distance_from_center = math.hypot(cur_x_corr - self.circle_center_x,
+                                                    cur_y_corr - self.circle_center_y)
+
+                    # 최대 이탈 갱신(보정값 기준)
                     if distance_from_center > self.max_distance_from_center:
                         self.max_distance_from_center = distance_from_center
 
-                    if distance_from_center <= self.circle_radius:
+                    within_last = distance_from_center <= self.circle_radius
+                    within_max  = self.max_distance_from_center <= self.circle_radius
+
+                    if within_last and within_max:
                         self.pass_fail_label.setText("판정 결과: 합격")
                         self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: green;")
-                        self.pass_fail_result = "합격"   # ★ 문자열 저장
+                        self.pass_fail_result = "합격"
                     else:
                         self.pass_fail_label.setText("판정 결과: 불합격")
                         self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: red;")
                         self.passed_judgment = False
-                        self.pass_fail_result = "불합격"  # ★ 문자열 저장
+                        self.pass_fail_result = "불합격"
+
                     QApplication.processEvents()
             elif not self.passed_judgment:
                 self.pass_fail_label.setText("판정 결과: 불합격")
                 self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: red;")
-                self.pass_fail_result = "불합격"  # ★ 유지
+                self.pass_fail_result = "불합격"
             else:
                 self.pass_fail_label.setText("판정 결과: -")
                 self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: gray;")
-                self.pass_fail_result = "-"        # ★ 유지
+                self.pass_fail_result = "-"
         else:
             self.pass_fail_label.setText("판정 결과: -")
             self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: gray;")
-            self.pass_fail_result = "-"            # ★ 유지
+            self.pass_fail_result = "-"
 
+        self._update_corrected_metrics_and_overlay()
+        self._refresh_pass_fail_label()  # ← 보정궤적 업데이트 직후 라벨도 동기화
+
+        x_corr_arr, y_corr_arr = self._get_corrected_arrays()
+        if not x_corr_arr:
+            x_corr_arr, y_corr_arr = [], []
+
+        show_yellow = getattr(self, "chk_show_yellow", None)
+        show_yellow = True if show_yellow is None else show_yellow.isChecked()
+
+        show_blue = getattr(self, "chk_show_blue", None)
+        show_blue = True if show_blue is None else show_blue.isChecked()
 
         self.plot_widget.update_plot(
             self.frame_count, dx_px, dy_px, self.PIXEL_TO_MM,
@@ -972,28 +1645,103 @@ class ColorTrackerApp(QWidget):
             ax1_xtick_interval=self.ax1_xtick_interval, ax1_ytick_interval=self.ax1_ytick_interval,
             ax2_xtick_interval=self.ax2_xtick_interval, ax2_ytick_interval=self.ax2_ytick_interval,
             ax3_xtick_interval=self.ax3_xtick_interval, ax3_ytick_interval=self.ax3_ytick_interval,
-            global_cumulative_x=self.global_cumulative_x,
-            global_cumulative_y=self.global_cumulative_y,
+
+            # ✅ 원본 궤적(토글 ON일 때만 데이터 전달)
+            global_cumulative_x = self.global_cumulative_x if show_yellow else None,
+            global_cumulative_y = self.global_cumulative_y if show_yellow else None,
+            global_cumulative_x_blue = self.global_cumulative_x_blue if show_blue else None,
+            global_cumulative_y_blue = self.global_cumulative_y_blue if show_blue else None,
+
+            # 판정 원
             circle_center_x=self.circle_center_x,
             circle_center_y=self.circle_center_y,
-            circle_radius=self.circle_radius
+            circle_radius=self.circle_radius,
+
+            # 보정 궤적(항상 전달)
+            global_corrected_x=x_corr_arr, global_corrected_y=y_corr_arr,
+
+            # ✅ 파랑 오프셋도 꼭 넘겨주기
+            traj_blue_offset_x=self.traj_blue_offset_x,
+            traj_blue_offset_y=self.traj_blue_offset_y,
+
+            # ✅ 토글 상태
+            show_yellow_traj=show_yellow,
+            show_blue_traj=show_blue,
         )
 
+
+        self._update_corrected_metrics_and_overlay()
+
         if not self.video_slider.isSliderDown():
-            self.video_slider.setValue(self.frame_count)
-            current_time_sec = self.frame_count / self.cap.get(cv2.CAP_PROP_FPS) if self.cap.get(cv2.CAP_PROP_FPS) > 0 else 0
-            self.current_time_label.setText(QTime(0, 0, 0).addSecs(int(current_time_sec)).toString("mm:ss"))
+            self.video_slider.setValue(self.frame_count if not self.is_camera_mode else 0)
+            if self.is_camera_mode:
+                current_time_sec = self.frame_count / max(self.current_fps, 1e-6)
+            else:
+                fps = self.cap.get(cv2.CAP_PROP_FPS)
+                current_time_sec = self.frame_count / fps if fps > 0 else 0
+            self.current_time_label.setText(QTime(0,0,0).addSecs(int(current_time_sec)).toString("mm:ss"))
+
+
+    def _fresh_restart_from_zero(self):
+        """다음 재생을 위한 완전 초기화 + 0프레임에서 시작 준비"""
+        if self.cap is None:
+            return
+        # 0프레임으로 되감기
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self.frame_count = 0
+
+        # 추적 상태/버퍼 초기화
+        self.prev_center = None
+        if hasattr(self, "kf") and self.kf is not None:
+            self.kf.reset()
+
+        self.prev_center_blue = None
+        if hasattr(self, "kf_blue") and self.kf_blue is not None:
+            self.kf_blue.reset()
+
+        # 누적/오프셋 초기화
+        self.global_cumulative_x = [0.0]
+        self.global_cumulative_y = [0.0]
+        self.global_cumulative_x_blue = [0.0]
+        self.global_cumulative_y_blue = [0.0]
+        self.traj_x_offset = 0.0
+        self.traj_y_offset = 0.0
+        self.traj_blue_offset_x = 0.0
+        self.traj_blue_offset_y = 0.0
+
+        # 그래프 위젯 초기화(선 클리어 + 기본 메트릭)
+        self.plot_widget.reset()
+        self.plot_widget.show_default_metrics()
+
+        # UI 초기화
+        self.video_slider.setValue(0)
+        self.current_time_label.setText("00:00")
+        # 첫 프레임 표시
+        ret0, frame0 = self.cap.read()
+        if ret0:
+            self.display_frame(frame0)
+        # 다음 프레임이 0부터 나오도록 다시 0으로
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        # 판정 라벨 초기화
+        self.passed_judgment = True
+        self.pass_fail_label.setText("판정 결과: -")
+        self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: gray;")
+
+        # 플래그 해제
+        self._need_fresh_start = False
+
 
     def display_frame(self, frame):
         if frame is None:
-            print("로그: display_frame에 전달된 프레임이 None입니다. (여기까지 오면 안됨)")
+            self._d("로그: display_frame에 전달된 프레임이 None입니다. (여기까지 오면 안됨)")
             return
 
         try:
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            print("로그: BGR2RGB 변환 성공.")
+            self._d("로그: BGR2RGB 변환 성공.")
         except cv2.error as e:
-            print(f"로그: BGR2RGB 변환 실패: {e}")
+            self._d(f"로그: BGR2RGB 변환 실패: {e}")
             return
 
         height, width, channel = rgb_frame.shape
@@ -1001,26 +1749,33 @@ class ColorTrackerApp(QWidget):
 
         qimg = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
         if qimg.isNull():
-            print("로그: QImage 객체 생성 실패!")
+            self._d("로그: QImage 객체 생성 실패!")
             return
-        print("로그: QImage 객체 생성 성공.")
+        self._d("로그: QImage 객체 생성 성공.")
 
-        label_width = self.video_display_label.width()
+        label_width  = self.video_display_label.width()
         label_height = self.video_display_label.height()
-        print(f"로그: video_display_label의 현재 크기: W={label_width}, H={label_height}")
+        self._d(f"로그: video_display_label의 현재 크기: W={label_width}, H={label_height}")
 
         if label_width > 0 and label_height > 0:
-            self.video_display_label.setPixmap(QPixmap.fromImage(qimg).scaled(
-                label_width, label_height, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            print("로그: Pixmap이 QLabel에 성공적으로 설정됨 (스케일링 적용).")
+            pix = QPixmap.fromImage(qimg).scaled(
+                label_width, label_height, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.video_display_label.setPixmap(pix)
+            self._d("로그: Pixmap이 QLabel에 성공적으로 설정됨 (스케일링 적용).")
         else:
-            print("로그: video_display_label 크기가 유효하지 않습니다. 원본 Pixmap을 설정합니다.")
             self.video_display_label.setPixmap(QPixmap.fromImage(qimg))
-            print("로그: Pixmap이 QLabel에 성공적으로 설정됨 (스케일링 없음).")
+            self._d("로그: Pixmap이 QLabel에 성공적으로 설정됨 (스케일링 없음).")
 
-        self.video_display_label.repaint()
-        print("로그: display_frame 호출 완료.")
+        # repaint는 꼭 필요하진 않아요. 디버그 중 깜빡임 확인용이면 남겨두고, 평소엔 빼도 OK.
+        # self.video_display_label.repaint()
+        self._d("로그: display_frame 호출 완료.")
+
+        # 이건 프레임마다 호출하니 비용이 좀 있어요. 필요하면 주기 제한 걸어도 됩니다.
         self.update_fps_label()
+
+
+
 
     def _render_calibration_overlay(self):
         """
@@ -1048,11 +1803,11 @@ class ColorTrackerApp(QWidget):
         if len(self.calib_points) == 1 and self._calib_hover_img_pos is not None:
             px = math.hypot(self._calib_hover_img_pos[0]-self.calib_points[0][0],
                             self._calib_hover_img_pos[1]-self.calib_points[0][1])
-            cv2.putText(img, f"{px:.2f}px", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,0), 2, cv2.LINE_AA)
+            cv2.putText(img, f"{px:.3f}px", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,0), 2, cv2.LINE_AA)
         elif len(self.calib_points) >= 2:
             p1, p2 = self.calib_points[:2]
             px = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
-            cv2.putText(img, f"{px:.2f}px", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,255), 2, cv2.LINE_AA)
+            cv2.putText(img, f"{px:.3f}px", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,255), 2, cv2.LINE_AA)
 
         # 라벨에 갱신
         self.display_frame(img)
@@ -1199,16 +1954,6 @@ class ColorTrackerApp(QWidget):
         # 돋보기 활성화
         self.magnifier.show()
 
-    # NEW
-    def _snap_to_axis(self, p1, p2):
-        x1, y1 = p1
-        x2, y2 = p2
-        if abs(x2 - x1) >= abs(y2 - y1):
-            return (x2, y1)  # 수평 스냅
-        else:
-            return (x1, y2)  # 수직 스냅
-
-
     # 이벤트 필터 (로깅 전용)
     def eventFilter(self, obj, event):
         # 라벨 또는 부모에서 오는 이벤트를 감시
@@ -1329,7 +2074,7 @@ class ColorTrackerApp(QWidget):
         if len(self.calib_points) == 2:
             p1, p2 = self.calib_points
             px_dist = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-            print(f"로그: 두 번째 점 클릭. 픽셀 거리: {px_dist:.2f}")
+            print(f"로그: 두 번째 점 클릭. 픽셀 거리: {px_dist:.3f}")
 
             if px_dist == 0:
                 QMessageBox.warning(self, "오류", "두 점이 동일합니다. 다시 클릭해주세요.")
@@ -1341,7 +2086,7 @@ class ColorTrackerApp(QWidget):
 
             real_dist, ok = QInputDialog.getDouble(
                 self, "실제 길이 입력",
-                f"픽셀 거리: {px_dist:.2f} px\n실제 거리(mm)를 입력하세요:",
+                f"픽셀 거리: {px_dist:.3f} px\n실제 거리(mm)를 입력하세요:",
                 decimals=3, min=0.001)
 
             if ok and real_dist > 0:
@@ -1401,44 +2146,79 @@ class ColorTrackerApp(QWidget):
             return
 
         try:
-            # 데이터 준비
-            x_data = np.array(self.global_cumulative_x)
-            y_data = np.array(self.global_cumulative_y)
-            frame_numbers = np.arange(1, len(x_data) + 1)
-            distances = np.sqrt(x_data ** 2 + y_data ** 2)
+            # 노랑/파랑 누적 궤적
+            x_y = np.array(self.global_cumulative_x, dtype=float)
+            y_y = np.array(self.global_cumulative_y, dtype=float)
+            x_b = np.array(self.global_cumulative_x_blue, dtype=float) if self.global_cumulative_x_blue else np.zeros_like(x_y)
+            y_b = np.array(self.global_cumulative_y_blue, dtype=float) if self.global_cumulative_y_blue else np.zeros_like(y_y)
 
-            # 시작-마지막 점 차이
-            start_x, start_y = x_data[0], y_data[0]
-            end_x, end_y = x_data[-1], y_data[-1]
-            final_diff = math.hypot(end_x - start_x, end_y - start_y)
+            n = min(len(x_y), len(y_y), len(x_b), len(y_b))
+            x_y, y_y, x_b, y_b = x_y[:n], y_y[:n], x_b[:n], y_b[:n]
 
-            # 합/불
-            judgement = self.pass_fail_result
+            frames = np.arange(1, n + 1)
 
-            # Workbook 생성
+            # 원점 보정 적용(사용자가 원점 지정한 경우를 반영)
+            x_y0 = x_y - float(self.traj_x_offset)
+            y_y0 = y_y - float(self.traj_y_offset)
+            x_b0 = x_b - float(self.traj_blue_offset_x)
+            y_b0 = y_b - float(self.traj_blue_offset_y)
+
+            # ★ 보정값 = (노랑-원점) - (파랑-원점)
+            x_corr = x_y0 - x_b0
+            y_corr = y_y0 - y_b0
+
+            # 요약 지표(보정 기준)
+            # - 최대 중심 이탈: 원 중심 기준 거리의 최댓값
+            dist_center_corr = np.hypot(x_corr - float(self.circle_center_x),
+                                        y_corr - float(self.circle_center_y))
+            max_center_dev = float(np.max(dist_center_corr)) if dist_center_corr.size else 0.0
+            last_d = float(dist_center_corr[-1]) if dist_center_corr.size else float('inf')
+
+            passed = (
+                self.circle_radius is not None and self.circle_radius > 0 and
+                max_center_dev <= float(self.circle_radius) and
+                last_d <= float(self.circle_radius)
+            )
+            judgement = "합격" if passed else "불합격"
+
+            # - 시작-마지막 점 차이(보정)
+            start_end_diff = float(math.hypot(x_corr[-1] - x_corr[0], y_corr[-1] - y_corr[0])) if n >= 2 else 0.0
+
+            # - 합/불(보정): 최대 이탈이 반지름 이하면 합격
+            passed = (self.circle_radius is not None and self.circle_radius > 0 and max_center_dev <= float(self.circle_radius))
+            judgement = "합격" if passed else "불합격"
+
+            # 엑셀 작성
             wb = Workbook()
             ws = wb.active
             ws.title = "Tracking Data"
 
-            # 메인 테이블 (A1~D...)
-            ws.append(['Frame', 'X_cumulative_mm', 'Y_cumulative_mm', 'Distance_from_Origin_mm'])
-            for i in range(len(frame_numbers)):
-                ws.append([int(frame_numbers[i]),
-                        round(x_data[i], 5),
-                        round(y_data[i], 5),
-                        round(distances[i], 5)])
+            # 헤더: 프레임별 노랑/파랑/보정
+            ws.append([
+                'Frame',
+                'Yellow_X_mm', 'Yellow_Y_mm',
+                'Blue_X_mm',   'Blue_Y_mm',
+                'Corrected_X_mm (Y-B)', 'Corrected_Y_mm (Y-B)'
+            ])
 
-            # F2~G4에 항목/값 입력
-            ws['F2'] = "최대 중심 이탈 거리 (mm)"
-            ws['G2'] = round(self.max_distance_from_center, 3)
+            for i in range(n):
+                ws.append([
+                    int(frames[i]),
+                    round(x_y[i], 5), round(y_y[i], 5),
+                    round(x_b[i], 5), round(y_b[i], 5),
+                    round(x_corr[i], 5), round(y_corr[i], 5),
+                ])
 
-            ws['F3'] = "시작-마지막 점 차이 (mm)"
-            ws['G3'] = round(final_diff, 3)
+            # 요약(보정 기준)
+            ws['I2'] = "최대 중심 이탈 거리 (mm, 보정)"
+            ws['J2'] = round(max_center_dev, 3)
 
-            ws['F4'] = "합/불"
-            ws['G4'] = judgement
+            ws['I3'] = "시작-마지막 점 차이 (mm, 보정)"
+            ws['J3'] = round(start_end_diff, 3)
 
-            # 저장
+            ws['I4'] = "합/불 (보정 기준)"
+            ws['J4'] = judgement
+
             wb.save(filename)
             QMessageBox.information(self, "저장 완료", f"데이터가 '{filename}' 에 저장되었습니다.")
 
@@ -1454,8 +2234,19 @@ class ColorTrackerApp(QWidget):
 
         self.traj_x_offset = self.global_cumulative_x[-1]
         self.traj_y_offset = self.global_cumulative_y[-1]
-        QMessageBox.information(self, "궤적 원점 설정",
-                                f"현재 위치 ({self.traj_x_offset:.2f}mm, {self.traj_y_offset:.2f}mm)를 궤적의 새 원점으로 설정했습니다.")
+
+        if self.global_cumulative_x_blue and self.global_cumulative_y_blue:
+            self.traj_blue_offset_x = self.global_cumulative_x_blue[-1]
+            self.traj_blue_offset_y = self.global_cumulative_y_blue[-1]
+        else:
+            self.traj_blue_offset_x = 0.0
+            self.traj_blue_offset_y = 0.0
+
+        QMessageBox.information(
+            self, "궤적 원점 설정",
+            f"현재 위치 ({self.traj_x_offset:.3f}mm, {self.traj_y_offset:.3f}mm)를 궤적의 새 원점으로 설정했습니다.\n"
+            f"(파랑 기준도 함께 적용)"
+        )
         self.update_all_plots()
 
 
@@ -1507,14 +2298,25 @@ class ColorTrackerApp(QWidget):
             self.timer.stop()
             self.video_playing = False
             self.play_pause_button.setText("재생")
-            QMessageBox.information(self, "재생/일시정지", "영상이 일시정지되었습니다.")
+            # QMessageBox.information(self, "재생/일시정지", "영상이 일시정지되었습니다.")
         else:
+            if not self.is_camera_mode:
+                if self._need_fresh_start:
+                    self._fresh_restart_from_zero()
+                else:
+                    total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) if self.cap else 0
+                    cur   = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) if self.cap else 0
+                    if total > 0 and cur >= total - 1:
+                        self._fresh_restart_from_zero()
+
             self.timer.start(int(1000 / self.current_fps))
             if hasattr(self, "kf"):
                 self.kf.set_dt(1.0 / self.current_fps)  # ✅ 추가
+            if hasattr(self, "kf_blue") and self.kf_blue is not None:
+                self.kf_blue.set_dt(1.0 / self.current_fps)
             self.video_playing = True
             self.play_pause_button.setText("일시정지")
-            QMessageBox.information(self, "재생/일시정지", "영상이 재생됩니다.")
+            # QMessageBox.information(self, "재생/일시정지", "영상이 재생됩니다.")
 
     def stop_reset_video(self):
         self.timer.stop()
@@ -1527,6 +2329,8 @@ class ColorTrackerApp(QWidget):
             self.plot_widget.x_disp_data.clear()
             self.plot_widget.y_disp_data.clear()
             self.plot_widget.frame_idx.clear()
+            self.plot_widget.x_disp_data_blue.clear()
+            self.plot_widget.y_disp_data_blue.clear()
             self.global_cumulative_x = [0.0]
             self.global_cumulative_y = [0.0]
             self.traj_x_offset = 0.0
@@ -1563,7 +2367,15 @@ class ColorTrackerApp(QWidget):
 
         self.prev_center = None
         self.kf.reset()
-            
+        self.plot_widget.reset()
+        self.prev_center_blue = None
+        self.kf_blue.reset()
+        self.global_cumulative_x_blue = [0.0]
+        self.global_cumulative_y_blue = [0.0]
+        self.plot_widget.show_default_metrics()
+
+        self._need_fresh_start = True
+
     def go_to_frame(self):
         if self.cap is None:
             QMessageBox.warning(self, "경고", "먼저 동영상을 열어주세요.")
@@ -1587,9 +2399,12 @@ class ColorTrackerApp(QWidget):
         self.frame_count = target_frame
         self.prev_center = None
         self.kf.reset()
+        self.plot_widget.reset()
         self.plot_widget.x_disp_data.clear()
         self.plot_widget.y_disp_data.clear()
         self.plot_widget.frame_idx.clear()
+        self.plot_widget.x_disp_data_blue.clear()
+        self.plot_widget.y_disp_data_blue.clear()
         self.global_cumulative_x = [0.0]
         self.global_cumulative_y = [0.0]
         self.traj_x_offset = 0.0
@@ -1605,6 +2420,8 @@ class ColorTrackerApp(QWidget):
             self.plot_widget.ax3.set_ylim(self.ax3_ylim_min, self.ax3_ylim_max)
             self.plot_widget.ax3.set_aspect('equal', adjustable='box')
 
+            x_corr_arr, y_corr_arr = self._get_corrected_arrays()
+            
             self.plot_widget.update_plot(
                 self.frame_count, 0, 0, self.PIXEL_TO_MM,
                 self.traj_x_offset, self.traj_y_offset,
@@ -1619,7 +2436,10 @@ class ColorTrackerApp(QWidget):
                 global_cumulative_y=self.global_cumulative_y,
                 circle_center_x=self.circle_center_x,
                 circle_center_y=self.circle_center_y,
-                circle_radius=self.circle_radius
+                circle_radius=self.circle_radius,
+                global_corrected_x=x_corr_arr, global_corrected_y=y_corr_arr,
+                traj_blue_offset_x=self.traj_blue_offset_x,
+                traj_blue_offset_y=self.traj_blue_offset_y
             )
             self.passed_judgment = True
             self.pass_fail_label.setText("판정 결과: -")
@@ -1650,6 +2470,8 @@ class ColorTrackerApp(QWidget):
             self.plot_widget.x_disp_data.clear()
             self.plot_widget.y_disp_data.clear()
             self.plot_widget.frame_idx.clear()
+            self.plot_widget.x_disp_data_blue.clear()
+            self.plot_widget.y_disp_data_blue.clear()
             self.global_cumulative_x = [0.0]
             self.global_cumulative_y = [0.0]
             self.traj_x_offset = 0.0
@@ -1693,10 +2515,23 @@ class ColorTrackerApp(QWidget):
             self.update_fps_label()  # << 추가
         self.was_playing_before_calib = False
 
+
     def update_all_plots(self):
-        current_frame_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) if self.cap else 0
+        # 보정 궤적 배열
+        x_corr_arr, y_corr_arr = self._get_corrected_arrays()
+        if not x_corr_arr:   # None or 비어있을 때 안전 처리
+            x_corr_arr, y_corr_arr = [], []
+
+        # 토글 상태 (체크박스 이름 통일)
+        show_yellow = self.chk_show_yellow.isChecked()
+        show_blue   = self.chk_show_blue.isChecked()
+
+        # 프레임 간 이동량은 단순 리프레시이므로 0으로 전달
+        dx_px = 0.0
+        dy_px = 0.0
+
         self.plot_widget.update_plot(
-            current_frame_pos, 0, 0, self.PIXEL_TO_MM,
+            self.frame_count, dx_px, dy_px, self.PIXEL_TO_MM,
             self.traj_x_offset, self.traj_y_offset,
             ax1_ylim_min=self.ax1_ylim_min, ax1_ylim_max=self.ax1_ylim_max,
             ax2_ylim_min=self.ax2_ylim_min, ax2_ylim_max=self.ax2_ylim_max,
@@ -1705,12 +2540,34 @@ class ColorTrackerApp(QWidget):
             ax1_xtick_interval=self.ax1_xtick_interval, ax1_ytick_interval=self.ax1_ytick_interval,
             ax2_xtick_interval=self.ax2_xtick_interval, ax2_ytick_interval=self.ax2_ytick_interval,
             ax3_xtick_interval=self.ax3_xtick_interval, ax3_ytick_interval=self.ax3_ytick_interval,
-            global_cumulative_x=self.global_cumulative_x,
-            global_cumulative_y=self.global_cumulative_y,
+
+            # 원본 궤적(토글 ON일 때만 전달)
+            global_cumulative_x=self.global_cumulative_x if show_yellow else None,
+            global_cumulative_y=self.global_cumulative_y if show_yellow else None,
+            global_cumulative_x_blue=self.global_cumulative_x_blue if show_blue else None,
+            global_cumulative_y_blue=self.global_cumulative_y_blue if show_blue else None,
+
+            # 판정 원
             circle_center_x=self.circle_center_x,
             circle_center_y=self.circle_center_y,
-            circle_radius=self.circle_radius
+            circle_radius=self.circle_radius,
+
+            # 보정 궤적
+            global_corrected_x=x_corr_arr,
+            global_corrected_y=y_corr_arr,
+
+            # 파랑 오프셋
+            traj_blue_offset_x=self.traj_blue_offset_x,
+            traj_blue_offset_y=self.traj_blue_offset_y,
+
+            # 토글 상태
+            show_yellow_traj=show_yellow,
+            show_blue_traj=show_blue,
         )
+
+        self._update_corrected_metrics_and_overlay()
+
+
 
     def apply_ax1_ylim(self):
         self.ax1_ylim_min = self.parse_float_input(self.ax1_ylim_min_input)
@@ -1726,17 +2583,17 @@ class ColorTrackerApp(QWidget):
 
         self.update_all_plots()
 
-        self.plot_widget.lock_ax1 = True   # <- 추가
+        # self.plot_widget.lock_ax1 = True   # <- 추가
 
     def apply_ax1_xtick_interval(self):
         self.ax1_xtick_interval = self.parse_float_input(self.ax1_xtick_interval_input)
         self.update_all_plots()
-        self.plot_widget.lock_ax1 = True   # <- 추가
+        # self.plot_widget.lock_ax1 = True   # <- 추가
 
     def apply_ax1_ytick_interval(self):
         self.ax1_ytick_interval = self.parse_float_input(self.ax1_ytick_interval_input)
         self.update_all_plots()
-        self.plot_widget.lock_ax1 = True   # <- 추가
+        # self.plot_widget.lock_ax1 = True   # <- 추가
 
     def apply_ax2_ylim(self):
         self.ax2_ylim_min = self.parse_float_input(self.ax2_ylim_min_input)
@@ -1751,17 +2608,17 @@ class ColorTrackerApp(QWidget):
             return
 
         self.update_all_plots()
-        self.plot_widget.lock_ax2 = True   # <- 추가
+        # self.plot_widget.lock_ax2 = True   # <- 추가
 
     def apply_ax2_xtick_interval(self):
         self.ax2_xtick_interval = self.parse_float_input(self.ax2_xtick_interval_input)
         self.update_all_plots()
-        self.plot_widget.lock_ax2 = True   # <- 추가
+        # self.plot_widget.lock_ax2 = True   # <- 추가
 
     def apply_ax2_ytick_interval(self):
         self.ax2_ytick_interval = self.parse_float_input(self.ax2_ytick_interval_input)
         self.update_all_plots()
-        self.plot_widget.lock_ax2 = True   # <- 추가
+        # self.plot_widget.lock_ax2 = True   # <- 추가
 
     def apply_ax3_xlim(self):
         self.ax3_xlim_min = self.parse_float_input(self.ax3_xlim_min_input)
@@ -1836,10 +2693,10 @@ class ColorTrackerApp(QWidget):
         self.ax2_xtick_interval = None
         self.ax2_ytick_interval = None
 
-        self.ax3_xlim_min = -10.0
-        self.ax3_xlim_max = 10.0
-        self.ax3_ylim_min = -10.0
-        self.ax3_ylim_max = 10.0
+        self.ax3_xlim_min = -3.0
+        self.ax3_xlim_max = 3.0
+        self.ax3_ylim_min = -3.0
+        self.ax3_ylim_max = 3.0
         self.ax3_xtick_interval = None
         self.ax3_ytick_interval = None
 
@@ -1873,6 +2730,33 @@ class ColorTrackerApp(QWidget):
         self.plot_widget.lock_ax2 = False
         self.plot_widget.lock_ax3 = False
 
+    def _refresh_pass_fail_label(self):
+        x_corr, y_corr = self._get_corrected_arrays()
+        # 보정 궤적이 있고, 반지름이 유효할 때만 판정
+        if x_corr and y_corr and self.circle_radius is not None and self.circle_radius > 0:
+            x = np.asarray(x_corr, dtype=float) - float(self.traj_x_offset)
+            y = np.asarray(y_corr, dtype=float) - float(self.traj_y_offset)
+
+            d_all = np.hypot(
+                x - float(self.circle_center_x),
+                y - float(self.circle_center_y)
+            )
+            last_d = float(d_all[-1])
+            max_d  = float(np.max(d_all))
+
+            ok = (last_d <= float(self.circle_radius)) and (max_d <= float(self.circle_radius))
+            result = "합격" if ok else "불합격"
+            color = "green" if ok else "red"
+
+            self.pass_fail_label.setText(f"판정 결과: {result}")
+            self.pass_fail_label.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {color};")
+            self.pass_fail_result = result
+
+        else:
+            self.pass_fail_label.setText("판정 결과: -")
+            self.pass_fail_label.setStyleSheet("font-size: 18px; font-weight: bold; color: gray;")
+            self.pass_fail_result = "-"
+
     def apply_circle_criteria(self):
         center_x = self.parse_float_input(self.circle_center_x_input)
         center_y = self.parse_float_input(self.circle_center_y_input)
@@ -1895,6 +2779,7 @@ class ColorTrackerApp(QWidget):
             QMessageBox.warning(self, "입력 오류", "원형 기준선 값을 올바르게 입력해주세요. 기본값으로 설정됩니다.")
 
         self.update_all_plots()
+        self._refresh_pass_fail_label()   # ← 추가
 
 class KalmanCV2D:
     def __init__(self, dt=1/30.0, process_var=1e-2, measurement_var=5.0):
