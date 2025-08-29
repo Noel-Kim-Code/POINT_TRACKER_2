@@ -2738,10 +2738,10 @@ class ColorTrackerApp(QWidget):
         self.ax2_xtick_interval = None
         self.ax2_ytick_interval = None
 
-        self.ax3_xlim_min = -3.0
-        self.ax3_xlim_max = 3.0
-        self.ax3_ylim_min = -3.0
-        self.ax3_ylim_max = 3.0
+        self.ax3_xlim_min = -2.0
+        self.ax3_xlim_max = 2.0
+        self.ax3_ylim_min = -2.0
+        self.ax3_ylim_max = 2.0
         self.ax3_xtick_interval = None
         self.ax3_ytick_interval = None
 
@@ -2755,7 +2755,7 @@ class ColorTrackerApp(QWidget):
         self.circle_radius_input.setPlaceholderText("2.0")
         self.circle_center_x = 0.0
         self.circle_center_y = 0.0
-        self.circle_radius = 2.0
+        self.circle_radius = 1.0
 
     def reset_axis_limits(self):
         self.reset_axis_limits_ui_only()
