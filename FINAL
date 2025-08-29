@@ -95,6 +95,21 @@ class CustomToolbar(NavigationToolbar):
             
             self.canvas.draw_idle()
 
+    def home(self, *args, **kwargs):
+        # 기본 동작(뷰 스택 복원) 먼저 수행
+        super().home(*args, **kwargs)
+
+        # 우리의 스크롤 창 로직을 강제로 다시 적용
+        self.parent_widget.lock_ax1 = False
+        self.parent_widget.lock_ax2 = False
+        self.parent_widget._apply_scrolling_window()   # 아래 2)에서 추가하는 함수
+
+        # Home이 autoscale을 켜버릴 수 있어서 꺼줌
+        for ax in (self.parent_widget.ax1, self.parent_widget.ax2):
+            ax.set_autoscale_on(False)
+
+        self.canvas.draw_idle()
+
 class MultiPlotWidget(QWidget):
     def __init__(self, max_points=50):
         super().__init__()
@@ -141,8 +156,8 @@ class MultiPlotWidget(QWidget):
         # 초기 범위
         self.ax1.set_ylim(-0.05, 0.05)
         self.ax2.set_ylim(-0.05, 0.05)
-        self.ax3.set_xlim(-3, 3)
-        self.ax3.set_ylim(-3, 3)
+        self.ax3.set_xlim(-2, 2)
+        self.ax3.set_ylim(-2, 2)
 
         # --- Data (고정 길이 윈도우) ---
         from collections import deque
@@ -203,6 +218,18 @@ class MultiPlotWidget(QWidget):
                     linewidth=2.0, alpha=0.98)
         )
         self.metrics_box.set_in_layout(False)
+
+    def _apply_scrolling_window(self):
+        """ax1/ax2를 '최근 max_points 프레임' 창으로 재설정"""
+        if len(self.frame_idx) == 0:
+            self.ax1.set_xlim(0, 1)
+            self.ax2.set_xlim(0, 1)
+        else:
+            last_frame = int(self.frame_idx[-1])
+            xmin = 0 if last_frame < self.max_points else last_frame - (self.max_points - 1)
+            xmax = max(xmin + 1, last_frame)
+            self.ax1.set_xlim(xmin, xmax)
+            self.ax2.set_xlim(xmin, xmax)
 
     def _dedup_legend(self, handles, labels):
         """같은 라벨은 하나만 남기기."""
@@ -290,8 +317,8 @@ class MultiPlotWidget(QWidget):
         self.ax2.set_xlim(0, 1)
         self.ax1.set_ylim(-0.05, 0.05)
         self.ax2.set_ylim(-0.05, 0.05)
-        self.ax3.set_xlim(-3, 3)
-        self.ax3.set_ylim(-3, 3)
+        self.ax3.set_xlim(-2, 2)
+        self.ax3.set_ylim(-2, 2)
         self.ax3.set_aspect('equal', adjustable='box')
 
         # 작은 결과 라벨(있으면) 비우기
@@ -300,6 +327,22 @@ class MultiPlotWidget(QWidget):
 
         self.canvas.draw_idle()
 
+    def reset_ax1_ax2_full(self):
+        """초기화 버튼용: X축=0~전체, Y축=자동으로 재설정"""
+        # X축: 0 ~ 마지막 프레임(데이터 없으면 0~1)
+        if len(self.frame_idx) > 0:
+            last = int(self.frame_idx[-1])
+            xmin, xmax = 0, max(1, last)
+        else:
+            xmin, xmax = 0, 1
+        self.ax1.set_xlim(xmin, xmax)
+        self.ax2.set_xlim(xmin, xmax)
+
+        # Y축: 자동
+        for ax in (self.ax1, self.ax2):
+            ax.set_autoscale_on(True)   # update_plot에서 꺼놨던 autoscale을 일시 복구
+            ax.relim()
+            ax.autoscale_view(scalex=False, scaley=True)
 
     def _lock_ax(self, which):
         if   which == 'ax1': self.lock_ax1 = True
@@ -363,10 +406,12 @@ class MultiPlotWidget(QWidget):
             xmin = 0 if last_frame < self.max_points else last_frame - (self.max_points - 1)
             xmax = max(xmin + 1, last_frame)
             self.ax1.set_xlim(xmin, xmax)
+            self.ax1.set_autoscale_on(False)   # ← 추가
         if not self.lock_ax2:
             xmin = 0 if last_frame < self.max_points else last_frame - (self.max_points - 1)
             xmax = max(xmin + 1, last_frame)
             self.ax2.set_xlim(xmin, xmax)
+            self.ax2.set_autoscale_on(False)   # ← 추가
 
         # --- 5) 라벨/눈금 ---
         self.ax1.set_xlabel("프레임 번호")
@@ -764,8 +809,8 @@ class ColorTrackerApp(QWidget):
         # 궤적 표시 토글
         self.traj_toggle_group = QGroupBox("궤적 표시")
         tog_layout = QHBoxLayout()
-        self.chk_show_yellow = QCheckBox("노랑(Y) 궤적")
-        self.chk_show_blue   = QCheckBox("파랑(B) 궤적")
+        self.chk_show_yellow = QCheckBox("로드(Y) 궤적")
+        self.chk_show_blue   = QCheckBox("AlN(B) 궤적")
         tog_layout.addWidget(self.chk_show_yellow)
         tog_layout.addWidget(self.chk_show_blue)
         tog_layout.addStretch()
@@ -791,7 +836,7 @@ class ColorTrackerApp(QWidget):
 
         judgment_layout.addWidget(QLabel("원 반지름 (mm):"), 2, 0)
         self.circle_radius_input = QLineEdit()
-        self.circle_radius_input.setPlaceholderText("2.0")
+        self.circle_radius_input.setPlaceholderText("1.0")
         judgment_layout.addWidget(self.circle_radius_input, 2, 1)
 
         self.apply_circle_button = QPushButton("기준 적용")
@@ -875,7 +920,7 @@ class ColorTrackerApp(QWidget):
 
         self.circle_center_x = 0.0
         self.circle_center_y = 0.0
-        self.circle_radius = 2.0
+        self.circle_radius = 1.0
 
         self._calib_hover_img_pos = None
         self._magnifier_size = 120
@@ -2715,6 +2760,9 @@ class ColorTrackerApp(QWidget):
     def reset_axis_limits(self):
         self.reset_axis_limits_ui_only()
         self.timer.setInterval(int(1000 / self.current_fps))
+
+        # ax1/ax2도 실제로 초기화
+        self.plot_widget.reset_ax1_ax2_full()
 
         self.plot_widget.ax1.autoscale_view(True, True, True)
         self.plot_widget.ax2.autoscale_view(True, True, True)
